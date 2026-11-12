@@ -1,0 +1,331 @@
+# 企业 Agent 平台 MVP 底座（T01，ADR-004：Compose 单机为 MVP 部署单元）
+#
+# 一条 `docker compose up -d --build` 拉起：
+#   平台侧：app（FastAPI，启动前自动迁移）、db（PostgreSQL+pgvector）、redis
+#   观测侧：Langfuse v4 自托管全套（官方模板形态：postgres/clickhouse/minio/redis 独立实例，
+#           不与平台 db/redis 混用，避免 BullMQ 队列要求（noeviction）与平台缓存策略冲突）
+#
+# 端口暴露：app 8000、平台 db/redis 绑定 127.0.0.1（宿主侧用 15432/16379，避开本机其它项目占用的 5432/6379）、
+# Langfuse UI 3000、MinIO S3 9090（浏览器直传）
+# 其余基础设施仅存在于 compose 内网，不映射宿主机端口
+
+name: agent-platform
+
+# 平台应用环境变量（T05 起供 app 与 worker 两个服务共用，同一镜像不同入口）
+x-app-env: &app_env
+  APP_ENV: ${APP_ENV:-local}
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_platform}
+  REDIS_URL: redis://redis:6379/0
+  # T02 认证（ADR-006）：token 签名密钥与初始管理员
+  AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is required, see .env.example}
+  ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-Changeme-1234}
+  # T03 观测：Langfuse Python SDK v5 自动读取这三个变量；密钥与 INIT 共用同一值，重建卷后不变
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:?set LANGFUSE_INIT_PROJECT_PUBLIC_KEY in .env}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:?set LANGFUSE_INIT_PROJECT_SECRET_KEY in .env}
+  LANGFUSE_BASE_URL: http://langfuse-web:3000
+  # T03 模型网关（v0.2 §5.5 M1）：映射表配置驱动，改 .env 四行即切模型零代码改动
+  MODEL_GATEWAY_BASE_URL: ${MODEL_GATEWAY_BASE_URL:-http://fake-openai:8000/v1}
+  MODEL_GATEWAY_API_KEY: ${MODEL_GATEWAY_API_KEY:-demo-key-not-for-prod}
+  MODEL_CHAT_MODEL: ${MODEL_CHAT_MODEL:-demo-chat-1}
+  MODEL_EMBEDDING_MODEL: ${MODEL_EMBEDDING_MODEL:-demo-embedding-1}
+  # T05 对象存储（MinIO 平台实例）与入库任务参数
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-agentplatform}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-agent-minio-secret}
+  MINIO_BUCKET: ${MINIO_BUCKET:-agent-platform-documents}
+  INGEST_LEASE_SECONDS: ${INGEST_LEASE_SECONDS:-60}
+  INGEST_MAX_ATTEMPTS: ${INGEST_MAX_ATTEMPTS:-3}
+  INGEST_RETRY_BACKOFF_SECONDS: ${INGEST_RETRY_BACKOFF_SECONDS:-10}
+  INGEST_HEALTH_PORT: ${INGEST_HEALTH_PORT:-9101}
+
+services:
+  # ---------------- 平台侧 ----------------
+
+  # 平台主库：用户/角色/ACL、任务队列、LangGraph Checkpoint、pgvector 向量（v0.2 §6.1/6.3）
+  db:
+    image: docker.io/pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - agent_platform_pg_data:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agent_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # 平台 Redis：登录态/缓存/限流（v0.2 §6.2）。本地单机绑定 127.0.0.1，暂不设密码（MVP 演示约定）
+  redis:
+    image: docker.io/redis:7
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - agent_platform_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 12
+
+  # 平台应用：FastAPI 骨架，无状态（ADR-004）；容器启动先执行迁移再启动服务
+  app:
+    build: .
+    image: agent-platform/app:${APP_VERSION:-0.1.0}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment: *app_env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/readyz', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # T05：入库 Worker——同一镜像独立进程，消费 PG 任务队列（ADR-005：表 + SKIP LOCKED 租约）
+  worker:
+    build: .
+    image: agent-platform/app:${APP_VERSION:-0.1.0}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: ["python", "-m", "agent_platform.ingest.worker"]
+    environment: *app_env
+    healthcheck:
+      # slim 镜像无 ps/pgrep；worker 内置 TCP 健康端口，连接成功即存活
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 9101), 3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # T05：平台对象存储（MinIO 平台实例，独立于 langfuse-minio）：原始文档归档
+  # 镜像用 cgr.dev/chainguard/minio：与 langfuse-minio 同款（本地已有缓存），
+  # docker.io/minio/minio 在 daocloud 镜像源 403 且直连 Docker Hub 不可达（见 README 排障节）
+  minio:
+    image: cgr.dev/chainguard/minio
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentplatform}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-agent-minio-secret}
+    ports:
+      - "127.0.0.1:9001:9000"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 3s
+
+  # T03：OpenAI-compatible 演示服务（仅标准库）：免真实 API key 即可演示网关与观测链路；
+  # 切真实模型只需改 .env 的 MODEL_GATEWAY_BASE_URL / API_KEY / 模型名，本服务可停用
+  fake-openai:
+    build: ./tools/fake-openai
+    image: agent-platform/fake-openai:0.1.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8100:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u, sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # ---------------- 观测侧（Langfuse v4 官方自托管模板形态） ----------------
+
+  langfuse-postgres:
+    image: docker.io/postgres:17
+    restart: always
+    environment:
+      POSTGRES_USER: ${LANGFUSE_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${LANGFUSE_POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    restart: always
+    # BullMQ 要求 noeviction，防止队列 key 在内存压力下被逐出
+    command: >
+      --requirepass ${LANGFUSE_REDIS_AUTH:-langfuse-redis-secret}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${LANGFUSE_REDIS_AUTH:-langfuse-redis-secret} ping | grep -q PONG"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.3.62.3
+    restart: always
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    restart: always
+    entrypoint: sh
+    # 启动前预建 langfuse bucket（官方模板做法）
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+    ports:
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9091:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  langfuse-worker:
+    # 官方模板用 docker.langfuse.com（其 307 回源 Docker Hub，在 DNS 污染环境不可达）；
+    # 故改用 Docker Hub 官方路径，由 daemon 的 registry-mirrors（见 README 排障节）代理拉取
+    image: docker.io/langfuse/langfuse-worker:${LANGFUSE_IMAGE_TAG:-4}
+    restart: always
+    depends_on: &langfuse_deps
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    environment: &langfuse_env
+      # Next.js 会把 HOSTNAME（默认=容器主机名→容器 IP）当作绑定地址，
+      # 导致容器内 127.0.0.1 不可达；显式绑 0.0.0.0 保证 healthcheck 与跨容器访问
+      HOSTNAME: 0.0.0.0
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3000}
+      DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER:-postgres}:${LANGFUSE_POSTGRES_PASSWORD:-postgres}@langfuse-postgres:5432/${LANGFUSE_POSTGRES_DB:-postgres}
+      SALT: ${LANGFUSE_SALT:?LANGFUSE_SALT is required, see .env.example}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?LANGFUSE_ENCRYPTION_KEY is required, see .env.example}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:-langfuse-redis-secret}
+      # 首次启动自动初始化账号/项目，开箱可演示（凭据见 .env）；
+      # 项目 API keys 显式固定，与 app 容器的 LANGFUSE_PUBLIC_KEY/SECRET_KEY 同源，保证上报可鉴权
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-agent-platform-org}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Agent Platform}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-agent-platform-project}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-Agent Platform MVP}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:?set LANGFUSE_INIT_PROJECT_PUBLIC_KEY in .env}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:?set LANGFUSE_INIT_PROJECT_SECRET_KEY in .env}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@agent-platform.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-Changeme-1234}
+    # worker 与 web 路由不同：worker 健康端点为 /api/health（web 为 /api/public/health）
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:${LANGFUSE_IMAGE_TAG:-4}
+    restart: always
+    depends_on: *langfuse_deps
+    ports:
+      - "3000:3000"
+    environment:
+      <<: *langfuse_env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?LANGFUSE_NEXTAUTH_SECRET is required, see .env.example}
+      # 浏览器直传媒体文件需经宿主机可达地址；服务端写入走 INTERNAL_ENDPOINT（内网地址）
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9090
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://langfuse-minio:9000
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  agent_platform_pg_data:
+    driver: local
+  agent_platform_redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  langfuse_postgres_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_clickhouse_logs:
+    driver: local
+  langfuse_minio_data:
+    driver: local
+  langfuse_redis_data:
+    driver: local

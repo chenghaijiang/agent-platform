@@ -1,0 +1,5 @@
+{"id": "install", "question": "产品如何安装？", "expected_document": "product.md", "must_cover": ["安装", "许可证"]}
+{"id": "deploy", "question": "产品支持哪些部署模式？", "expected_document": "product.md", "must_cover": ["部署"]}
+{"id": "cloud", "question": "云托管模式是不是开箱即用？", "expected_document": "product.md", "must_cover": ["云托管"]}
+{"id": "license", "question": "许可证密钥在哪里配置？", "expected_document": "product.md", "must_cover": ["许可证", "安装"]}
+{"id": "offline", "question": "量子纠缠的退相干机制如何影响量子比特寿命？", "expected_document": "", "must_cover": []}

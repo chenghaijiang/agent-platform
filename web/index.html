@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知源 · 企业知识问答工作台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700;900&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23F2F4F0'/%3E%3Ccircle cx='16' cy='16' r='12' fill='%232E5E4E'/%3E%3Ccircle cx='16' cy='16' r='4.5' fill='%23B02E2E'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ================= 登录页 ================= -->
+<section id="view-login" class="view active">
+  <div class="login-card">
+    <div class="login-brand">知源<span class="seal-dot"></span></div>
+    <div class="login-sub">企业知识问答工作台 · 内部系统</div>
+    <div class="field">
+      <label for="lg-user">账号</label>
+      <input id="lg-user" type="text" placeholder="用户名" autocomplete="username">
+    </div>
+    <div class="field">
+      <label for="lg-pass">密码</label>
+      <input id="lg-pass" type="password" placeholder="密码" autocomplete="current-password">
+    </div>
+    <div class="login-error" id="login-error" hidden></div>
+    <button class="login-btn" id="login-btn">登 录</button>
+    <div class="login-foot">
+      <span>内置账号体系 · 演示环境</span>
+      <a class="oidc" href="javascript:void(0)" id="oidc-link" title="阶段二对接企业 SSO">SSO 登录（预留）</a>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 应用主框架 ================= -->
+<section id="view-app" class="view">
+  <header class="topbar">
+    <div class="topbar-brand">知源<span class="seal-dot"></span></div>
+    <nav class="topbar-nav" id="topbar-nav">
+      <button data-route="chat" class="on">知识问答</button>
+      <button data-route="kb" id="nav-kb">知识库</button>
+      <button data-route="users" id="nav-users">用户与权限</button>
+    </nav>
+    <div class="topbar-user">
+      <span class="role-chip" id="user-role-chip"></span>
+      <div class="avatar" id="user-avatar"></div>
+      <span id="user-name"></span>
+      <button class="btn-mini btn-logout" id="logout-btn">登出</button>
+    </div>
+  </header>
+
+  <!-- ============ 知识问答 ============ -->
+  <div class="workspace" id="route-chat">
+    <aside class="conv-rail">
+      <div class="rail-head">
+        <span>最近会话</span>
+        <button class="new-conv" id="new-conv-btn">＋ 新会话</button>
+      </div>
+      <div class="conv-list" id="conv-list"></div>
+      <div class="rail-foot">
+        <b>当前应用</b>：企业知识问答助手<br>
+        <b>链路</b>：检索 ACL 过滤 · Guardrails 治理 · 引用可溯
+      </div>
+    </aside>
+
+    <main class="chat-main">
+      <div class="chat-scroll" id="chat-scroll">
+        <div class="chat-inner" id="chat-inner">
+          <div class="chat-empty" id="chat-empty">
+            <div class="t">向知识助手提问</div>
+            <div class="s">回答基于你有权访问的知识库生成，每条结论均可追溯引用来源</div>
+          </div>
+        </div>
+      </div>
+      <div class="composer">
+        <div class="composer-inner">
+          <textarea id="composer-input" placeholder="向知识助手提问…（Enter 发送）" aria-label="提问输入框"></textarea>
+          <button class="send-btn" id="send-btn">发 送</button>
+        </div>
+        <div class="composer-tip">回答基于你有权访问的知识库生成 · 每条结论均标注引用来源</div>
+      </div>
+    </main>
+
+    <aside class="cite-panel" aria-label="引用来源面板">
+      <div class="cite-head">
+        <div class="h">引用来源</div>
+        <div class="s" id="cite-meta">暂无检索</div>
+      </div>
+      <div class="cite-list" id="cite-list">
+        <div class="cite-empty">左侧选择会话并发起提问<br>引用来源将在此逐条展示</div>
+      </div>
+      <div class="cite-foot">
+        <b>权限说明</b>：仅展示当前账号可见的知识库内容，越权访问已由检索层过滤并写入审计。
+      </div>
+    </aside>
+  </div>
+
+  <!-- ============ 知识库 ============ -->
+  <div class="admin-view" id="route-kb" hidden>
+    <div class="admin-inner">
+      <div class="admin-title">知识库管理</div>
+      <div class="admin-sub">上传后由入库任务自动完成解析、切分与向量化（PostgreSQL 任务队列 · Worker 异步执行）</div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <span class="t">文档上传<span class="hint">支持 PDF / Markdown / 纯文本，单文件 ≤ 20MB</span></span>
+        </div>
+        <div class="upload-zone" id="upload-zone" role="button" tabindex="0">
+          <div class="big">点击选择文件上传到下方选定的知识库</div>
+          上传即创建入库任务，解析 → 切分 → 向量化 → 写入索引
+          <div class="fmt">入库进度可在下方任务列表查看，失败自动重试</div>
+        </div>
+        <div class="upload-row">
+          <label>目标知识库</label>
+          <select id="upload-kb-select"></select>
+          <span class="upload-hint" id="upload-hint">同库同内容重复上传将幂等返回已有任务</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <span class="t">入库任务</span>
+          <span class="hint">状态机：排队中 → 运行中 → 成功 / 失败（重试耗尽后 dead）</span>
+        </div>
+        <table class="grid" id="kb-jobs-table">
+          <thead>
+            <tr><th>文档</th><th>知识库</th><th>密级</th><th>状态</th><th>重试</th><th>创建时间</th></tr>
+          </thead>
+          <tbody id="kb-jobs-body"><tr><td colspan="6" class="dim">暂无入库任务</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="t">知识库一览</span></div>
+        <table class="grid">
+          <thead>
+            <tr><th>知识库</th><th>密级</th><th>说明</th><th>授权角色</th><th>索引版本</th></tr>
+          </thead>
+          <tbody id="kb-list-body"><tr><td colspan="5" class="dim">加载中…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="t">新建知识库</span></div>
+        <div class="kb-form">
+          <div class="kb-form-row">
+            <div class="field-inline"><label>名称</label><input id="kb-name" placeholder="如 kb-product-manual"></div>
+            <div class="field-inline"><label>密级</label>
+              <select id="kb-classification">
+                <option value="public">公开</option>
+                <option value="internal" selected>内部</option>
+                <option value="confidential">机密</option>
+              </select>
+            </div>
+            <div class="field-inline grow"><label>说明</label><input id="kb-desc" placeholder="一句话描述该库存放什么内容"></div>
+            <button class="send-btn" id="kb-create-btn">创 建</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 用户与权限 ============ -->
+  <div class="admin-view" id="route-users" hidden>
+    <div class="admin-inner">
+      <div class="admin-title">用户与权限</div>
+      <div class="admin-sub">简化 ACL：用户 → 角色 → 知识库可见范围（检索时按矩阵过滤，越权访问写入审计）</div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="t">用户</span><span class="hint">点击行可在下方矩阵中对照该角色权限</span></div>
+        <table class="grid">
+          <thead>
+            <tr><th>用户</th><th>角色</th><th>状态</th><th>创建时间</th></tr>
+          </thead>
+          <tbody id="user-list-body"><tr><td colspan="4" class="dim">加载中…</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="t">角色 × 知识库 ACL 矩阵</span><span class="hint">数据实时来自 ACL 表，检索过滤与此严格一致</span></div>
+        <table class="grid perm-grid" id="perm-grid">
+          <thead id="perm-head"></thead>
+          <tbody id="perm-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<input type="file" id="file-input" hidden>
+<div id="toast-wrap"></div>
+<script src="app.js"></script>
+</body>
+</html>

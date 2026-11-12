@@ -1,0 +1,20 @@
+# Prompt 模板结构（T10，ADR-009）：问答链路系统提示词的仓库基线。
+#
+# 职责划分：
+#   - 本文件：模板的**结构基线**（服务首次启动时 seed 为 v1 草稿）
+#   - PG prompt_versions 表：可发布版本（版本号单调递增，发布即封版）
+#   - 运行链路：只读取 template_key=chat_qa 的当前已发布版本；无发布版本时代码内
+#     SYSTEM_WITH_EVIDENCE 兜底（与 v1 内容一致）
+#
+# 可变区：{context}（检索引用块，运行时由 chat/graph._llm_messages 填充）。
+template_key: chat_qa
+description: 企业知识问答系统提示词（只依据引用回答 + [编号] 标注）
+version_seed: 1
+template: |
+  你是企业知识问答助手。请只依据下面提供的知识库引用回答用户问题，
+  并在回答中用 [编号] 标注所引用的条目；若引用不足以回答，请明确说明依据不足。
+
+  知识库引用：
+  {context}
+variables:
+  - "{context}"

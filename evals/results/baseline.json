@@ -1,0 +1,39 @@
+{
+  "timestamp": "2026-11-13T01:32:56",
+  "base_url": "http://localhost:8000",
+  "hit_rate": 0.8,
+  "coverage": 0.8,
+  "cases": 5,
+  "details": [
+    {
+      "id": "install",
+      "hit": true,
+      "coverage": 0.5,
+      "answer_preview": "[fake-openai echo] 产品如何安装？"
+    },
+    {
+      "id": "deploy",
+      "hit": true,
+      "coverage": 1.0,
+      "answer_preview": "[fake-openai echo] 产品支持哪些部署模式？"
+    },
+    {
+      "id": "cloud",
+      "hit": true,
+      "coverage": 1.0,
+      "answer_preview": "[fake-openai echo] 云托管模式是不是开箱即用？"
+    },
+    {
+      "id": "license",
+      "hit": true,
+      "coverage": 0.5,
+      "answer_preview": "[fake-openai echo] 许可证密钥在哪里配置？"
+    },
+    {
+      "id": "offline",
+      "hit": false,
+      "coverage": 1.0,
+      "answer_preview": "[fake-openai echo] 量子纠缠的退相干机制如何影响量子比特寿命？"
+    }
+  ]
+}

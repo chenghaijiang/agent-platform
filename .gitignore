@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 环境与密钥（.env.example 可提交，.env 含真实密钥不可提交）
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# 系统
+.DS_Store
+
+# 评测运行产物（baseline.json 为基线入库，last.json 每次运行重新生成，CI 自行产出并上传 artifact）
+evals/results/last.json

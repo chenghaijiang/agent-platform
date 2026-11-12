@@ -1,0 +1,31 @@
+# 评测 CI（T10，ADR-010）：PR 时运行评测并与基线对比，结果作为提示、不阻塞合并。
+#
+# 说明：agent-platform 目前尚未初始化独立 Git 仓库；本文件在仓库初始化后生效。
+# CI 环境无被测服务时脚本自动输出 SKIPPED 并以 0 退出（评测永不红灯阻塞）；
+# 部署预览环境时设置 EVAL_BASE_URL / EVAL_USERNAME / EVAL_PASSWORD 即可执行真实评测。
+name: evals
+
+on:
+  pull_request:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    continue-on-error: true # 评测是提示信号（ADR-010），失败不阻塞合并
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --frozen --no-dev
+      - name: Run evals (advisory)
+        run: |
+          uv run python evals/run_eval.py || true
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: evals/results/last.json
+          if-no-files-found: ignore
