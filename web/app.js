@@ -15,6 +15,9 @@ const state = {
   sending: false,
   kbPollTimer: null,
   kbs: [],
+  chunksCache: new Map(), // task_id → 切片预览（succeeded 后不变，缓存避免轮询重复拉取）
+  chunksOpen: new Set(),  // 当前展开切片预览的任务 id
+  lastTasksKey: "",       // 上次任务列表 JSON：数据未变时跳过 DOM 重建（避免打断用户点击）
 };
 
 /* ============================================================
@@ -297,6 +300,13 @@ function bindCites(scope) {
   });
 }
 
+function highlightBlock(block, citations, runId) {
+  // 问答块 ↔ 引用面板联动：点击任意历史问答块，右侧面板切换到该轮的引用
+  document.querySelectorAll("#chat-inner .a-block").forEach((b) => b.classList.remove("cur"));
+  block.classList.add("cur");
+  renderCites(citations || [], runId);
+}
+
 function fillGov(strip, runId) {
   const items = [
     "Guardrails 输入脱敏 · 已执行",
@@ -354,11 +364,15 @@ async function openSession(sessionId) {
     }
     let lastCitations = [];
     let lastRunId = null;
+    let lastBlock = null;
     for (const run of ordered) {
       appendQuestion(inner, run.question);
       const runId = run.id;
       const block = buildAnswerBlock(inner, runId);
       const body = block.querySelector(".a-body");
+      const cites = run.citations || [];
+      block.title = "点击查看该轮回答的引用来源";
+      block.addEventListener("click", () => highlightBlock(block, cites, runId));
       if (run.status === "failed") {
         body.classList.add("err");
         body.innerHTML = `<p>本次回答执行失败：${esc(run.error || "未知错误")}</p>`;
@@ -367,9 +381,9 @@ async function openSession(sessionId) {
         p.textContent = run.answer;
         body.innerHTML = "";
         body.appendChild(p);
-        const cites = run.citations || [];
         lastCitations = cites;
         lastRunId = runId;
+        lastBlock = block;
         appendCiteRow(body, cites);
         fillGov(block.querySelector(".gov-strip"), runId);
       } else {
@@ -377,6 +391,7 @@ async function openSession(sessionId) {
       }
     }
     renderCites(lastCitations, lastRunId);
+    if (lastBlock) lastBlock.classList.add("cur");
     scrollBottom();
   } catch (err) {
     toast(errText(err), true);
@@ -425,7 +440,7 @@ async function sendQuestion() {
     appendCiteRow(body, citations || []);
     fillGov(block.querySelector(".gov-strip"), runId);
     block.querySelector(".meta").textContent = runId ? "Run " + runId.slice(0, 8) : "";
-    renderCites(citations || [], runId);
+    highlightBlock(block, citations || [], runId);
     setSending(false);
     scrollBottom();
     loadSessions(); // 刷新会话列表顺序
@@ -548,6 +563,10 @@ async function loadKbTasks() {
     );
     const tasks = perKb.flat().sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
     const hasPending = tasks.some((t) => t.status === "queued" || t.status === "running");
+    // 数据未变不重建：轮询周期内用户可能正在点击展开切片，重建会让节点失效
+    const tasksKey = JSON.stringify(tasks);
+    if (tasksKey === state.lastTasksKey) return hasPending;
+    state.lastTasksKey = tasksKey;
     $("kb-jobs-body").innerHTML = tasks.length
       ? tasks
           .map((t) => {
@@ -555,8 +574,10 @@ async function loadKbTasks() {
             const detail = t.status === "failed" && t.last_error ? " · " + esc(t.last_error).slice(0, 40) : "";
             const [sealCls, sealText] = sealOf(t.kbClassification);
             const time = t.created_at ? t.created_at.slice(5, 16).replace("T", " ") : "";
-            return `<tr>
-              <td>${esc(t.source_filename)}</td>
+            const clickable = t.status === "succeeded";
+            const open = state.chunksOpen.has(t.id);
+            return `<tr${clickable ? ' class="clickable chunks-toggle" title="点击查看切片结果"' : ""} data-tid="${t.id}" data-kb="${t.kb_id}">
+              <td>${esc(t.source_filename)}${clickable ? `<span class="chunk-arrow">${open ? "▾" : "▸"}</span>` : ""}</td>
               <td>${esc(t.kbName)}</td>
               <td><span class="doc-seal-inline ${sealCls}">${sealText}</span></td>
               <td><span class="job-state ${cls}">${label}${detail}</span></td>
@@ -566,10 +587,70 @@ async function loadKbTasks() {
           })
           .join("")
       : '<tr><td colspan="6" class="dim">暂无入库任务</td></tr>';
+    const tbody = $("kb-jobs-body");
+    tbody.querySelectorAll("tr.chunks-toggle").forEach((tr) => {
+      tr.addEventListener("click", () => toggleChunks(tr.dataset.tid, tr));
+    });
+    // 轮询重渲染后重建已展开的切片预览行
+    for (const tid of state.chunksOpen) {
+      const tr = tbody.querySelector(`tr[data-tid="${tid}"]`);
+      if (tr) insertChunkRow(tid, tr);
+    }
     return hasPending;
   } catch {
     return false;
   }
+}
+
+async function toggleChunks(taskId, tr) {
+  if (state.chunksOpen.has(taskId)) {
+    state.chunksOpen.delete(taskId);
+    const row = document.querySelector(`tr[data-chrow="${taskId}"]`);
+    if (row) row.remove();
+    const arrow = tr.querySelector(".chunk-arrow");
+    if (arrow) arrow.textContent = "▸";
+    return;
+  }
+  if (!state.chunksCache.has(taskId)) {
+    try {
+      state.chunksCache.set(taskId, await api(`/admin/kbs/${tr.dataset.kb}/tasks/${taskId}/chunks?limit=500`));
+    } catch (err) {
+      toast(errText(err), true);
+      return;
+    }
+  }
+  state.chunksOpen.add(taskId);
+  insertChunkRow(taskId, tr);
+  const arrow = tr.querySelector(".chunk-arrow");
+  if (arrow) arrow.textContent = "▾";
+}
+
+function insertChunkRow(taskId, tr) {
+  const data = state.chunksCache.get(taskId);
+  if (!data) return;
+  const old = document.querySelector(`tr[data-chrow="${taskId}"]`);
+  if (old) old.remove();
+  const row = document.createElement("tr");
+  row.className = "chunk-detail-row";
+  row.dataset.chrow = taskId;
+  row.innerHTML = `<td colspan="6">${renderChunkPreview(data)}</td>`;
+  row.addEventListener("click", (e) => e.stopPropagation());
+  tr.after(row);
+}
+
+function renderChunkPreview(data) {
+  const statusLabel = (JOB_STATE[data.status] || [null, data.status])[1];
+  const head = `共 ${data.total} 个切片${data.total > data.chunks.length ? ` · 当前显示前 ${data.chunks.length} 个` : ""} · ${esc(data.source_filename)} · 任务状态 ${esc(statusLabel)}`;
+  const items = data.chunks
+    .map((c) => {
+      const text = c.content.length > 200 ? c.content.slice(0, 200) + "…" : c.content;
+      return `<div class="chunk-item">
+        <div class="ci-head"><span class="ci-idx">#${c.chunk_index}</span><span class="ci-hd">${esc(c.heading_path || "（无标题路径）")}</span><span class="ci-meta">${c.char_count} 字符 · 向量 ${c.embedding_dim ?? "—"} 维 · ${esc(sealOf(c.classification)[1])}</span></div>
+        <div class="ci-body">${esc(text)}</div>
+      </div>`;
+    })
+    .join("");
+  return `<div class="chunk-preview"><div class="cp-head">${head}</div>${items || '<div class="ci-empty">（无切片数据）</div>'}</div>`;
 }
 
 function startKbPoll() {
@@ -653,21 +734,58 @@ async function loadUsersPage() {
       });
     });
 
+    // 新建用户表单的角色下拉随角色表刷新（保留当前选择）
+    const roleSel = $("nu-role");
+    const curRole = roleSel.value;
+    roleSel.innerHTML = roles.map((r) => `<option value="${esc(r.name)}">${esc(r.name)}</option>`).join("");
+    if (roles.some((r) => r.name === curRole)) roleSel.value = curRole;
+
+    const isSelf = (u) => u.username === state.user.username;
     $("user-list-body").innerHTML = users.length
       ? users
           .map((u) => {
             const time = u.created_at ? u.created_at.slice(0, 10) : "";
+            const roleOpts = roles
+              .map((r) => `<option value="${esc(r.name)}"${r.name === u.role ? " selected" : ""}>${esc(r.name)}</option>`)
+              .join("");
+            const self = isSelf(u);
             return `<tr class="clickable" data-role="${esc(u.role)}">
               <td>${esc(u.display_name || u.username)}<span class="dim" style="margin-left:8px;font-size:12px">${esc(u.username)}</span></td>
-              <td><span class="pill">${esc(u.role)}</span></td>
+              <td><select class="op-select" data-uid="${u.id}" ${self ? 'disabled title="不能修改自己的角色"' : ""}>${roleOpts}</select></td>
               <td><span class="job-state ${u.is_active ? "js-done" : "js-fail"}">${u.is_active ? "正常" : "停用"}</span></td>
+              <td><button class="op-btn${u.is_active ? " danger" : ""}" data-uid="${u.id}" data-next="${u.is_active ? "false" : "true"}" ${self && u.is_active ? 'disabled title="不能停用自己"' : ""}>${u.is_active ? "停用" : "启用"}</button></td>
               <td class="dim">${time}</td>
             </tr>`;
           })
           .join("")
-      : '<tr><td colspan="4" class="dim">暂无用户</td></tr>';
+      : '<tr><td colspan="5" class="dim">暂无用户</td></tr>';
     $("user-list-body").querySelectorAll("tr.clickable").forEach((row) => {
       row.addEventListener("click", () => selectUser(row.dataset.role));
+    });
+    $("user-list-body").querySelectorAll(".op-select").forEach((sel) => {
+      sel.addEventListener("click", (e) => e.stopPropagation());
+      sel.addEventListener("change", async () => {
+        try {
+          await api(`/admin/users/${sel.dataset.uid}`, { method: "PATCH", body: JSON.stringify({ role: sel.value }) });
+          toast(`角色已更新为 ${sel.value}`);
+          loadUsersPage();
+        } catch (err) {
+          toast(errText(err), true);
+          loadUsersPage();
+        }
+      });
+    });
+    $("user-list-body").querySelectorAll(".op-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        try {
+          await api(`/admin/users/${btn.dataset.uid}`, { method: "PATCH", body: JSON.stringify({ is_active: btn.dataset.next === "true" }) });
+          toast(btn.dataset.next === "true" ? "用户已启用" : "用户已停用");
+          loadUsersPage();
+        } catch (err) {
+          toast(errText(err), true);
+        }
+      });
     });
 
     const head = `<tr><th>角色</th>${kbs.map((kb) => `<th>${esc(kb.name)}</th>`).join("")}</tr>`;
@@ -677,12 +795,26 @@ async function loadUsersPage() {
         const cells = kbs
           .map((kb) => {
             const allow = grants.get(role.name) && grants.get(role.name).has(kb.id);
-            return `<td class="${allow ? "allow" : "deny"}">${allow ? "可读" : "不可见"}</td>`;
+            return `<td class="${allow ? "allow" : "deny"} toggler" data-role="${esc(role.name)}" data-kb="${kb.id}" title="点击切换该角色对此知识库的可读授权">${allow ? "可读" : "不可见"}</td>`;
           })
           .join("");
         return `<tr data-role="${esc(role.name)}"><td><span class="pill">${esc(role.name)}</span></td>${cells}</tr>`;
       })
       .join("");
+    $("perm-body").querySelectorAll("td.toggler").forEach((td) => {
+      td.addEventListener("click", async () => {
+        const grant = td.classList.contains("allow");
+        const { role, kb } = td.dataset;
+        try {
+          if (grant) await api(`/admin/kbs/${kb}/acls/${role}`, { method: "DELETE" });
+          else await api(`/admin/kbs/${kb}/acls`, { method: "POST", body: JSON.stringify({ role }) });
+          toast(grant ? `已收回 ${role} 的该库可读权限` : `已授予 ${role} 该库可读权限`);
+          loadUsersPage();
+        } catch (err) {
+          toast(errText(err), true);
+        }
+      });
+    });
   } catch (err) {
     toast(errText(err), true);
   }
@@ -694,6 +826,30 @@ function selectUser(role) {
   });
   const visible = $("perm-body").querySelectorAll(`tr[data-role="${CSS.escape(role)}"] td.allow`).length;
   toast(`${role} 的视角：可检索 ${visible} 个知识库`);
+}
+
+async function createUser() {
+  const username = $("nu-username").value.trim();
+  const password = $("nu-password").value;
+  const display = $("nu-display").value.trim();
+  const role = $("nu-role").value;
+  if (!username || !password) {
+    toast("请填写用户名与初始密码（≥8 位）", true);
+    return;
+  }
+  try {
+    await api("/admin/users", {
+      method: "POST",
+      body: JSON.stringify({ username, password, display_name: display || null, role }),
+    });
+    toast(`用户 ${username} 已创建（角色 ${role}）`);
+    $("nu-username").value = "";
+    $("nu-password").value = "";
+    $("nu-display").value = "";
+    loadUsersPage();
+  } catch (err) {
+    toast(errText(err), true);
+  }
 }
 
 /* ============================================================
@@ -720,5 +876,6 @@ document.addEventListener("DOMContentLoaded", () => {
     if (files.length) uploadFiles(files);
   });
   $("kb-create-btn").addEventListener("click", createKb);
+  $("user-create-btn").addEventListener("click", createUser);
   boot();
 });

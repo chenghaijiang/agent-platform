@@ -90,6 +90,10 @@ services:
       minio:
         condition: service_healthy
     environment: *app_env
+    # 本地模型形态：宿主机 Ollama/vLLM 经 host.docker.internal 访问；
+    # macOS Docker Desktop 自带该域名，Linux 需此显式映射到宿主网关（Desktop 上同样兼容）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     healthcheck:
@@ -111,6 +115,9 @@ services:
         condition: service_healthy
     command: ["python", "-m", "agent_platform.ingest.worker"]
     environment: *app_env
+    # 与 app 一致：本地模型形态下 worker 也要访问宿主 Ollama/vLLM 做 embedding
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       # slim 镜像无 ps/pgrep；worker 内置 TCP 健康端口，连接成功即存活
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 9101), 3).close()"]

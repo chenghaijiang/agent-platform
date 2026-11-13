@@ -6,14 +6,14 @@
 import json
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_platform.api.deps import get_session
 from agent_platform.auth.deps import require_admin
 from agent_platform.core.config import settings
-from agent_platform.db.models import IngestTask, KnowledgeBase
+from agent_platform.db.models import IngestTask, KbChunk, KnowledgeBase
 from agent_platform.ingest import service
 from agent_platform.ingest.parser import SUPPORTED_SUFFIXES
 from agent_platform.ingest.storage import DocumentStorage
@@ -105,6 +105,57 @@ async def get_task(
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     return _serialize(task)
+
+
+@router.get("/kbs/{kb_id}/tasks/{task_id}/chunks")
+async def list_task_chunks(
+    kb_id: uuid.UUID,
+    task_id: uuid.UUID,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    _admin=Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """切片预览（admin）：查看某入库任务的切分结果与向量维度。
+
+    用于验证切片策略效果（chunk 大小/标题路径/字符数），以及排查
+    切换 embedding 模型后的维度混存问题（embedding_dim 字段）。
+    """
+    task = await session.get(IngestTask, task_id)
+    if task is None or task.kb_id != kb_id:
+        raise HTTPException(status_code=404, detail="task not found in this knowledge base")
+    total = await session.scalar(
+        select(func.count()).select_from(KbChunk).where(KbChunk.task_id == task_id)
+    )
+    chunks = (
+        await session.scalars(
+            select(KbChunk)
+            .where(KbChunk.task_id == task_id)
+            .order_by(KbChunk.chunk_index)
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    return {
+        "task_id": str(task.id),
+        "kb_id": str(task.kb_id),
+        "source_filename": task.source_filename,
+        "status": task.status,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "chunks": [
+            {
+                "chunk_index": c.chunk_index,
+                "heading_path": c.heading_path,
+                "content": c.content,
+                "char_count": len(c.content),
+                "classification": c.classification,
+                "embedding_dim": len(c.embedding) if c.embedding is not None else None,
+            }
+            for c in chunks
+        ],
+    }
 
 
 @router.get("/kbs/{kb_id}/tasks")

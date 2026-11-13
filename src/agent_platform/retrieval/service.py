@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from langfuse import observe
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import DataError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_platform.auth.provider import AuthContext
@@ -29,6 +30,16 @@ class RetrievalPermissionError(Exception):
     def __init__(self, denied_kb_ids: list[str]) -> None:
         self.denied_kb_ids = denied_kb_ids
         super().__init__(f"kb not visible for role: {denied_kb_ids}")
+
+
+class EmbeddingDimensionMismatchError(Exception):
+    """已入库向量与当前 embedding 模型维度不一致（切换模型后未清空重建）。"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "已入库向量与当前 embedding 模型维度不一致："
+            "切换模型后需清空向量重建（TRUNCATE kb_chunks, ingest_tasks 后重新上传文档）"
+        )
 
 
 @dataclass(frozen=True)
@@ -140,16 +151,23 @@ class RetrievalService:
         if not kb_ids:
             return []
         distance = KbChunk.embedding.cosine_distance(vector)
-        rows = (
-            await session.execute(
-                select(KbChunk, IngestTask.source_filename, KnowledgeBase.name, distance)
-                .join(IngestTask, IngestTask.id == KbChunk.task_id)
-                .join(KnowledgeBase, KnowledgeBase.id == KbChunk.kb_id)
-                .where(KbChunk.kb_id.in_(kb_ids))
-                .order_by(distance)
-                .limit(top_k)
-            )
-        ).all()
+        try:
+            rows = (
+                await session.execute(
+                    select(KbChunk, IngestTask.source_filename, KnowledgeBase.name, distance)
+                    .join(IngestTask, IngestTask.id == KbChunk.task_id)
+                    .join(KnowledgeBase, KnowledgeBase.id == KbChunk.kb_id)
+                    .where(KbChunk.kb_id.in_(kb_ids))
+                    .order_by(distance)
+                    .limit(top_k)
+                )
+            ).all()
+        except DataError as exc:
+            # pgvector 对维度不匹配的向量距离计算直接报错（如 fake 1536 维与 Ollama 1024 维混存）：
+            # 翻译成可操作的领域错误，而不是让 API 层裸 500
+            if "different vector dimensions" in str(exc):
+                raise EmbeddingDimensionMismatchError() from None
+            raise
         return [
             ("vector", chunk, filename, kb_name, 1.0 - dist)
             for chunk, filename, kb_name, dist in rows

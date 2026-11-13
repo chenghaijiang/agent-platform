@@ -169,17 +169,30 @@
       <div class="admin-sub">简化 ACL：用户 → 角色 → 知识库可见范围（检索时按矩阵过滤，越权访问写入审计）</div>
 
       <div class="panel">
-        <div class="panel-head"><span class="t">用户</span><span class="hint">点击行可在下方矩阵中对照该角色权限</span></div>
+        <div class="panel-head"><span class="t">新建用户</span><span class="hint">创建后即可用账号密码登录，角色决定知识库可见范围</span></div>
+        <div class="kb-form">
+          <div class="kb-form-row">
+            <div class="field-inline"><label>用户名</label><input id="nu-username" placeholder="字母/数字/._-，≥3 位"></div>
+            <div class="field-inline"><label>显示名</label><input id="nu-display" placeholder="选填"></div>
+            <div class="field-inline"><label>初始密码</label><input id="nu-password" type="password" placeholder="≥8 位"></div>
+            <div class="field-inline"><label>角色</label><select id="nu-role"></select></div>
+            <button class="send-btn" id="user-create-btn">创 建</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span class="t">用户</span><span class="hint">点击行可在下方矩阵中对照该角色权限；下拉改角色、按钮启停</span></div>
         <table class="grid">
           <thead>
-            <tr><th>用户</th><th>角色</th><th>状态</th><th>创建时间</th></tr>
+            <tr><th>用户</th><th>角色</th><th>状态</th><th>操作</th><th>创建时间</th></tr>
           </thead>
-          <tbody id="user-list-body"><tr><td colspan="4" class="dim">加载中…</td></tr></tbody>
+          <tbody id="user-list-body"><tr><td colspan="5" class="dim">加载中…</td></tr></tbody>
         </table>
       </div>
 
       <div class="panel">
-        <div class="panel-head"><span class="t">角色 × 知识库 ACL 矩阵</span><span class="hint">数据实时来自 ACL 表，检索过滤与此严格一致</span></div>
+        <div class="panel-head"><span class="t">角色 × 知识库 ACL 矩阵</span><span class="hint">数据实时来自 ACL 表，检索过滤与此严格一致；点击单元格可直接授权 / 收回</span></div>
         <table class="grid perm-grid" id="perm-grid">
           <thead id="perm-head"></thead>
           <tbody id="perm-body"></tbody>

@@ -38,7 +38,14 @@
   供应商异常在网关内翻译为 `ModelGatewayError` 族（Auth/RateLimit/Unavailable/BadRequest/Config）
 - **配置驱动映射表**：chat/embedding 两能力位的模型名由 `.env` 配置（`MODEL_CHAT_MODEL`/`MODEL_EMBEDDING_MODEL`），
   改配置重启即切换，零代码改动；默认指向 compose 内 `fake-openai` 演示服务（免真实 API key 即可完整演示）
-- **切真实供应商**：只改 `.env` 四行（BASE_URL/API_KEY/两模型名），如 `MODEL_GATEWAY_BASE_URL=https://api.openai.com/v1`
+- **三形态切换**：只改 `.env` 四行（BASE_URL/API_KEY/两模型名）+ `docker compose up -d` 重建，零代码改动
+  （模板见 `.env.example` 模型网关段）：
+  - **演示**（默认）：compose 内 fake-openai，免真实 key 走通网关与观测链路
+  - **线上**：OpenAI / DeepSeek / 通义等任一 OpenAI-compatible 云服务
+  - **本地**：宿主机 Ollama / vLLM / LM Studio，如 `MODEL_GATEWAY_BASE_URL=http://host.docker.internal:11434/v1`
+    （compose 已为 app/worker 注入 host-gateway 映射，Linux 亦可用；本地服务不校验 key，占位即可）
+  - ⚠️ 切换 embedding 模型须清空 kb_chunks 重新入库（不同模型向量空间不可混用；
+    embedding 列为无维度 vector，换维度模型无需改表）
 - **Langfuse 自动上报**：Langfuse Python SDK v5（OTel/OTLP）+ `langfuse.openai` drop-in instrument：
   每次调用自动产出 `@observe` SPAN → GENERATION/EMBEDDING 层级（含模型名、token 用量、延迟），
   UI（:3000）Tracing 页直接可查；高频路径批量上报，self-test 与关停时显式 flush

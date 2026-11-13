@@ -58,7 +58,9 @@ def _connection_error() -> openai.APIConnectionError:
 # ---------------- 统一结果（调用方不接触供应商 SDK 类型） ----------------
 
 
-async def test_chat_returns_unified_result() -> None:
+async def test_chat_returns_unified_result(monkeypatch) -> None:
+    # 显式固定模型名：不随 .env 切换真实/本地模型而漂移（测试自足）
+    monkeypatch.setattr(settings, "model_chat_model", "demo-chat-1")
     gw = _gateway()
 
     async def fake_create(**kwargs):
@@ -73,7 +75,8 @@ async def test_chat_returns_unified_result() -> None:
     assert result.latency_ms >= 0
 
 
-async def test_embed_returns_unified_result() -> None:
+async def test_embed_returns_unified_result(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "model_embedding_model", "demo-embedding-1")
     gw = _gateway()
 
     async def fake_create(**kwargs):

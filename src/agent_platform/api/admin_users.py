@@ -24,6 +24,13 @@ class CreateUserRequest(BaseModel):
     role: str = Field(min_length=1, max_length=32)
 
 
+class UpdateUserRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=128)
+    role: str | None = Field(default=None, min_length=1, max_length=32)
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=8, max_length=128)  # 重置密码
+
+
 class UserOut(BaseModel):
     id: uuid.UUID
     username: str
@@ -70,6 +77,43 @@ async def create_user(
     session.add(user)
     await session.commit()
     return _user_out(user, role.name).model_dump(mode="json")
+
+
+@router.patch("/users/{user_id}")
+async def update_user(
+    user_id: uuid.UUID,
+    payload: UpdateUserRequest,
+    context: AuthContext = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """管理员修改用户：显示名 / 角色 / 启停 / 重置密码，全字段可选（PATCH 语义）。
+
+    不允许停用自己：防止唯一管理员停用自己后平台失去管理入口。
+    """
+    user = await session.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+    # user.id 是 UUID、JWT sub 是字符串：统一转 str 比较，否则保护恒不生效
+    if payload.is_active is False and str(user.id) == context.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="cannot deactivate yourself"
+        )
+    if payload.role is not None:
+        role = await session.scalar(select(Role).where(Role.name == payload.role))
+        if role is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="unknown role"
+            )
+        user.role_id = role.id
+    if payload.display_name is not None:
+        user.display_name = payload.display_name
+    if payload.is_active is not None:
+        user.is_active = payload.is_active
+    if payload.password is not None:
+        user.password_hash = hash_password(payload.password)
+    await session.commit()
+    role_name = await session.scalar(select(Role.name).where(Role.id == user.role_id))
+    return _user_out(user, role_name or "").model_dump(mode="json")
 
 
 @router.get("/users")

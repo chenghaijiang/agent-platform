@@ -811,6 +811,79 @@ table.grid tbody tr.clickable:hover td { background: var(--paper); }
 @keyframes toastIn { from { opacity: 0; transform: translateX(12px); } }
 
 /* ============================================================
+   增强：问答块联动 / 切片预览 / 用户管理操作 / ACL 矩阵点击
+   ============================================================ */
+.a-block { cursor: pointer; }
+.a-block .a-body { transition: box-shadow .15s, border-color .15s; }
+.a-block.cur .a-body {
+  border-left-color: var(--pine-deep);
+  box-shadow: 0 0 0 1px #BBD3C8, var(--shadow);
+}
+
+.chunk-arrow {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--ink-faint);
+}
+
+.grid tr.chunk-detail-row > td { background: var(--pine-wash); }
+.chunk-preview { font-size: 12.5px; }
+.cp-head { margin-bottom: 10px; color: var(--ink-faint); }
+.chunk-item {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+.ci-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+  margin-bottom: 5px;
+}
+.ci-idx {
+  font-weight: 700;
+  color: var(--pine-deep);
+  font-size: 11.5px;
+  background: var(--pine-wash);
+  border: 1px solid #BBD3C8;
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+.ci-hd { color: var(--ink); font-weight: 500; font-size: 12px; }
+.ci-meta { color: var(--ink-faint); font-size: 11.5px; }
+.ci-body { color: var(--ink-faint); line-height: 1.65; word-break: break-word; }
+.ci-empty { color: var(--ink-faint); padding: 6px 2px; }
+
+.op-select {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  font-size: 12.5px;
+  padding: 3px 6px;
+  color: var(--ink);
+}
+.op-select:focus { outline: none; border-color: var(--pine); }
+.op-select:disabled { opacity: .45; cursor: not-allowed; }
+.op-btn {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: border-color .12s, color .12s;
+}
+.op-btn:hover { border-color: var(--pine); color: var(--pine-deep); }
+.op-btn.danger:hover { border-color: var(--seal); color: var(--seal); }
+.op-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.perm-grid td.allow { color: var(--pine-deep); }
+.perm-grid td.deny { color: #C03636; }
+.perm-grid td.toggler { cursor: pointer; user-select: none; }
+.perm-grid td.toggler:hover { outline: 2px solid var(--pine); outline-offset: -2px; }
+
+/* ============================================================
    响应式
    ============================================================ */
 @media (max-width: 1180px) {

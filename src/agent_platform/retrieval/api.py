@@ -9,6 +9,7 @@ from agent_platform.auth.deps import require_auth
 from agent_platform.auth.provider import AuthContext
 from agent_platform.retrieval.service import (
     MAX_TOP_K,
+    EmbeddingDimensionMismatchError,
     RetrievalPermissionError,
     RetrievalService,
 )
@@ -44,6 +45,9 @@ async def search(
                 "denied_kb_ids": exc.denied_kb_ids,
             },
         ) from None
+    except EmbeddingDimensionMismatchError as exc:
+        # 混合维度向量共存（切换 embedding 模型未清空重建）→ 409 + 可操作提示，不裸 500
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from None
 
     return {
         "query": result.query,
