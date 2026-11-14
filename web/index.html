@@ -42,6 +42,8 @@
       <button data-route="chat" class="on">知识问答</button>
       <button data-route="kb" id="nav-kb">知识库</button>
       <button data-route="users" id="nav-users">用户与权限</button>
+      <!-- Agent 工作台（T15）：独立功能域，新窗口打开；不入 hash 路由避免 app.js 误处理 -->
+      <a class="agentdesk-entry" href="/agentdesk.html" target="_blank" rel="noopener">Agent 工作台</a>
     </nav>
     <div class="topbar-user">
       <span class="role-chip" id="user-role-chip"></span>
@@ -196,6 +198,25 @@
         <table class="grid perm-grid" id="perm-grid">
           <thead id="perm-head"></thead>
           <tbody id="perm-body"></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <span class="t">审计事件</span>
+          <span class="hint">治理动作全链路留痕；Agent 工作台域含工具调用、越界/红线拦截、审批决策与门禁提交</span>
+          <select id="audit-domain" class="op-select" title="按功能域筛选">
+            <option value="">全部域</option>
+            <option value="agent_task">Agent 工作台</option>
+            <option value="chat">知识问答</option>
+            <option value="knowledge_base">知识库</option>
+          </select>
+        </div>
+        <table class="grid">
+          <thead>
+            <tr><th>时间</th><th>用户</th><th>域</th><th>动作</th><th>结果</th><th>摘要</th></tr>
+          </thead>
+          <tbody id="audit-body"><tr><td colspan="6" class="dim">加载中…</td></tr></tbody>
         </table>
       </div>
     </div>

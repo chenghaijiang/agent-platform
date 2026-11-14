@@ -210,6 +210,26 @@ select, input, textarea { font-family: inherit; }
   background: #6FBF9C;
 }
 
+/* Agent 工作台入口（T15）：双功能域并存，独立页面新窗口打开 */
+.topbar-nav .agentdesk-entry {
+  color: #B7C2BC;
+  font-size: 14px;
+  padding: 0 18px;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  position: relative;
+  transition: color .15s;
+}
+.topbar-nav .agentdesk-entry:hover { color: #fff; }
+.topbar-nav .agentdesk-entry::after {
+  content: "↗";
+  margin-left: 5px;
+  font-size: 11px;
+  color: #6FBF9C;
+}
+
 .topbar-user {
   margin-left: auto;
   display: flex;

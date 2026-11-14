@@ -815,6 +815,8 @@ async function loadUsersPage() {
         }
       });
     });
+
+    loadAudit();
   } catch (err) {
     toast(errText(err), true);
   }
@@ -826,6 +828,69 @@ function selectUser(role) {
   });
   const visible = $("perm-body").querySelectorAll(`tr[data-role="${CSS.escape(role)}"] td.allow`).length;
   toast(`${role} 的视角：可检索 ${visible} 个知识库`);
+}
+
+/* ============================================================
+   审计事件（T16：域标签展示；agentdesk 域 = object_type agent_task）
+   ============================================================ */
+const AUDIT_DOMAIN = {
+  agent_task: "Agent 工作台",
+  chat: "知识问答",
+  knowledge_base: "知识库",
+};
+const AUDIT_ACTION = {
+  "agentdesk.tool_call": "工具调用",
+  "agentdesk.out_of_bounds": "越界拦截",
+  "agentdesk.redline_blocked": "红线命令拦截",
+  "agentdesk.task_committed": "门禁提交",
+  "agentdesk.approval_decided": "审批决策",
+  "guard.input_masked": "输入脱敏",
+  "guard.output_masked": "输出脱敏",
+  "chat.ask": "会话提问",
+  "retrieval.denied": "检索越权拒绝",
+};
+
+function auditDetail(e) {
+  const d = e.detail || {};
+  const parts = [];
+  if (d.tool_name) parts.push(d.tool_name);
+  if (d.tool) parts.push(d.tool);
+  if (d.command) parts.push(String(d.command).slice(0, 80));
+  if (d.path) parts.push(String(d.path).slice(0, 60));
+  if (d.pattern) parts.push(`命中模式 ${d.pattern}`);
+  if (d.decision) parts.push(d.decision);
+  if (d.scope) parts.push(d.scope);
+  if (d.mode) parts.push(`模式 ${d.mode}`);
+  if (d.message) parts.push(String(d.message).slice(0, 80));
+  return parts.join(" · ") || e.object_id || "—";
+}
+
+async function loadAudit() {
+  const domain = $("audit-domain").value;
+  const body = $("audit-body");
+  try {
+    const events = await api("/admin/audit-events?limit=200");
+    const rows = events.filter((e) => !domain || e.object_type === domain);
+    body.innerHTML = rows.length
+      ? rows.map((e) => {
+          const time = e.created_at ? e.created_at.slice(5, 19).replace("T", " ") : "—";
+          const blocked = e.outcome === "blocked" || e.outcome === "denied";
+          const cls = blocked ? "js-fail" : (e.outcome === "allowed" || e.outcome === "ok" ? "js-done" : "js-queued");
+          const dom = AUDIT_DOMAIN[e.object_type] || e.object_type;
+          const act = AUDIT_ACTION[e.action] || e.action;
+          return `<tr>
+            <td class="dim">${esc(time)}</td>
+            <td>${esc(e.username || "—")}</td>
+            <td><span class="pill">${esc(dom)}</span></td>
+            <td>${esc(act)}</td>
+            <td><span class="job-state ${cls}">${esc(e.outcome)}</span></td>
+            <td class="dim">${esc(auditDetail(e))}</td>
+          </tr>`;
+        }).join("")
+      : '<tr><td colspan="6" class="dim">暂无审计事件</td></tr>';
+  } catch {
+    body.innerHTML = '<tr><td colspan="6" class="dim">审计事件加载失败（需要管理员权限）</td></tr>';
+  }
 }
 
 async function createUser() {
@@ -877,5 +942,6 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("kb-create-btn").addEventListener("click", createKb);
   $("user-create-btn").addEventListener("click", createUser);
+  $("audit-domain").addEventListener("change", loadAudit);
   boot();
 });
