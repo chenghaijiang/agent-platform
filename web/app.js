@@ -18,6 +18,27 @@ const state = {
   chunksCache: new Map(), // task_id → 切片预览（succeeded 后不变，缓存避免轮询重复拉取）
   chunksOpen: new Set(),  // 当前展开切片预览的任务 id
   lastTasksKey: "",       // 上次任务列表 JSON：数据未变时跳过 DOM 重建（避免打断用户点击）
+  // ---- 统一工作台（ADR-014~017 一期前端）----
+  profiles: [],           // 可选智能体（GET /workbench/profiles）
+  profileKey: "knowledge-assistant", // 新会话绑定的智能体（Q3A：换智能体 = 开新会话）
+  currentProfile: null,   // 当前会话绑定的智能体
+  streamAbort: null,      // 会话流 SSE 的 AbortController（切会话/登出时断开）
+  streamEpoch: 0,         // 会话流代数：递增使旧流的断线重连逻辑失效
+  seenSeq: 0,             // 已消费最大 seq（Last-Event-ID 续传游标）
+  renderedSeqs: new Set(),// 已渲染 seq（POST 直播与会话流双路去重）
+  pendingQuestion: null,  // POST SSE 直播中的 user 文本（会话流重复帧去重）
+  qaAnswer: "",           // POST SSE 直播中的 assistant 累积文本（同上）
+  qaDoneSeq: 0,           // 最近 done 帧的 assistant seq（会话流重复帧去重）
+  // ---- Agent 内嵌（harness 渲染体系移植，ADR-019 后续）----
+  qaModel: localStorage.getItem("zs_qa_model") || "", // 问答模式模型覆盖（空 = 平台默认）
+  hwModel: "",            // harness runtime 当前模型（/api/health 快照）
+  hwBusy: false,          // Agent turn 运行中
+  hwEpoch: 0,             // harness events 流代数（切会话/登出失效）
+  hwAbort: null,          // harness events SSE AbortController
+  hwTraceIds: new Map(    // platform session id → Set(traceId)（localStorage 持久化）
+    Object.entries(JSON.parse(localStorage.getItem("zs_hw_traces") || "{}")
+      ).map(([k, v]) => [k, new Set(v)])),
+  hwActiveSession: null,  // 发起当前 harness turn 的 platform 会话 id（跨会话事件归属判定）
 };
 
 /* ============================================================
@@ -67,6 +88,29 @@ async function api(path, opts = {}) {
   return res.status === 204 ? null : res.json();
 }
 
+/** harness 网关 fetch：经平台认证反代 /api/harness/*，返回 raw Response（与 harness 客户端同语义）。 */
+async function hwFetch(path, opts = {}) {
+  const res = await fetch("/api/harness" + path, {
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + state.token,
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401) {
+    logout();
+    throw new Error("登录已失效，请重新登录");
+  }
+  return res;
+}
+
+function persistHwTraces() {
+  const flat = {};
+  for (const [k, v] of state.hwTraceIds) flat[k] = [...v];
+  localStorage.setItem("zs_hw_traces", JSON.stringify(flat));
+}
+
 /* ============================================================
    登录 / 登出 / 启动恢复
    ============================================================ */
@@ -75,6 +119,12 @@ function logout() {
   state.user = null;
   state.currentSessionId = null;
   state.sessions = [];
+  state.currentProfile = null;
+  state.streamEpoch += 1; // 使会话流断线重连逻辑失效
+  if (state.streamAbort) { state.streamAbort.abort(); state.streamAbort = null; }
+  state.hwEpoch += 1;     // 使 harness events 流重连失效
+  state.hwBusy = false;
+  if (state.hwAbort) { state.hwAbort.abort(); state.hwAbort = null; }
   localStorage.removeItem("zs_token");
   localStorage.removeItem("zs_user");
   stopKbPoll();
@@ -89,6 +139,7 @@ function enterApp() {
   renderUserIdentity();
   applyRoleVisibility();
   renderSessions();
+  loadProfiles();
   // 保持刷新前的路由（#/kb、#/users）；非法或空路由才回落到对话页
   const current = (location.hash || "").replace(/^#\//, "");
   if (!["chat", "kb", "users"].includes(current)) location.hash = "#/chat";
@@ -195,7 +246,8 @@ window.addEventListener("hashchange", handleRoute);
 async function loadSessions() {
   if (!state.token) return;
   try {
-    state.sessions = await api("/sessions");
+    if (!state.profiles.length) await loadProfiles(); // openSession 的引擎分支判定依赖 profiles（首次进入时序保障）
+    state.sessions = await api("/workbench/sessions");
     renderSessions();
     if (!state.currentSessionId && state.sessions.length) {
       openSession(state.sessions[0].id);
@@ -215,26 +267,65 @@ function renderSessions() {
     .map((s) => {
       const on = s.id === state.currentSessionId ? " on" : "";
       const time = s.created_at ? s.created_at.slice(5, 16).replace("T", " ") : "";
+      const pv = state.profiles.find((p) => p.key === (s.profile_key || "knowledge-assistant"));
       return `<div class="conv-item${on}" data-sid="${s.id}">
         <div class="t">${esc(s.title || "新会话")}</div>
-        <div class="m">${esc(time)}</div>
+        <div class="m">${esc(time)}${pv ? ` · <span class="pv">${esc(pv.display_name)}</span>` : ""}</div>
+        <button class="conv-del" data-del="${s.id}" type="button" title="删除会话">×</button>
       </div>`;
     })
     .join("");
   list.querySelectorAll(".conv-item").forEach((el) => {
     el.addEventListener("click", () => openSession(el.dataset.sid));
   });
+  list.querySelectorAll(".conv-del").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation(); // 不触发会话切换
+      deleteSession(el.dataset.del);
+    });
+  });
+}
+
+async function deleteSession(sessionId) {
+  if (!confirm("删除该会话？聊天记录将一并清除，名下任务保留。")) return;
+  try {
+    await api(`/workbench/sessions/${sessionId}`, { method: "DELETE" });
+    state.sessions = state.sessions.filter((s) => s.id !== sessionId);
+    if (state.currentSessionId === sessionId) {
+      state.currentSessionId = null;
+      state.streamEpoch += 1; // 使旧会话流断线重连失效
+      if (state.streamAbort) { state.streamAbort.abort(); state.streamAbort = null; }
+      state.hwEpoch += 1;
+      if (state.hwAbort) { state.hwAbort.abort(); state.hwAbort = null; }
+      $("chat-inner").innerHTML =
+        '<div class="chat-empty"><div class="t">向知识助手提问</div><div class="s">回答基于你有权访问的知识库生成；右上角可选智能体（代码工程模式）与模型</div></div>';
+      applyProfileChrome();
+    }
+    renderSessions();
+    toast("会话已删除");
+  } catch (err) {
+    toast(errText(err), true);
+  }
 }
 
 async function newSession() {
   try {
-    const s = await api("/sessions", { method: "POST", body: JSON.stringify({ title: null }) });
+    const s = await api("/workbench/sessions", {
+      method: "POST",
+      body: JSON.stringify({ profile_key: state.profileKey, title: null }),
+    });
     state.sessions.unshift(s);
     state.currentSessionId = s.id;
-    $("chat-inner").innerHTML = ""; // 清空上一会话的问答块，避免残留
+    state.currentProfile = profileOf(s.profile_key);
+    $("chat-inner").innerHTML =
+      '<div class="chat-empty"><div class="t"></div><div class="s"></div></div>'; // 空态占位，由 applyProfileChrome 填文案
     renderSessions();
-    renderCites([], null);
-    toast("已创建新会话");
+    applyProfileChrome();
+    // 问答会话立即接入会话流；Agent 会话的容器与事件流由 sendAgentTurn / openSession 分支接管
+    const np = profileOf(s.profile_key);
+    if (!np || np.engine_kind === "qa_graph") startSessionStream(s.id);
+    else setStreamState("SSE 未连接", false); // 清除上一会话流的状态残留（Agent 流由发送/openSession 接管）
+    toast(`已创建新会话 · 绑定智能体「${agentName()}」`);
     $("composer-input").focus();
   } catch (err) {
     toast(errText(err), true);
@@ -259,54 +350,6 @@ function sealOf(classification) {
   return SEAL_MAP[classification] || ["seal-neibu", "内部"];
 }
 
-function citeCard(c, i) {
-  const [sealCls, sealText] = sealOf(c.classification);
-  const doc = c.document + (c.heading_path ? ` · ${c.heading_path}` : "");
-  const chunk = c.content && c.content.length > 160 ? c.content.slice(0, 160) + "…" : c.content;
-  return `<div class="cite-card" data-cite="${i + 1}">
-    <span class="seal-tag ${sealCls}">${sealText}</span>
-    <div class="doc">${esc(doc)}</div>
-    <div class="chunk">${esc(chunk)}</div>
-    <div class="foot"><span class="src">${esc(c.kb_name)} · chunk ${esc(String(c.chunk_id).slice(0, 8))}</span><span>相似度 ${Number(c.score).toFixed(2)}</span></div>
-  </div>`;
-}
-
-function renderCites(citations, runId) {
-  const list = $("cite-list");
-  const meta = $("cite-meta");
-  if (!citations.length) {
-    meta.textContent = "0 条证据 · 本次回答未引用知识库";
-    list.innerHTML = '<div class="cite-empty">无引用来源<br>该回答未命中知识库</div>';
-    return;
-  }
-  meta.textContent = `${citations.length} 条证据 · ACL 过滤后命中${runId ? " · Run " + runId.slice(0, 8) : ""}`;
-  list.innerHTML = citations.map((c, i) => citeCard(c, i)).join("");
-  list.querySelectorAll(".cite-card").forEach((card, i) => {
-    setTimeout(() => {
-      card.classList.add("shown");
-      const s = card.querySelector(".seal-tag");
-      if (s) s.classList.add("shown");
-    }, state.sending ? i * 220 : 0);
-  });
-}
-
-function bindCites(scope) {
-  scope.querySelectorAll(".cite").forEach((tag) => {
-    const target = document.querySelector(`.cite-card[data-cite="${tag.dataset.c}"]`);
-    if (!target) return;
-    tag.addEventListener("mouseenter", () => target.classList.add("hl"));
-    tag.addEventListener("mouseleave", () => target.classList.remove("hl"));
-    tag.addEventListener("click", () => target.scrollIntoView({ behavior: "smooth", block: "center" }));
-  });
-}
-
-function highlightBlock(block, citations, runId) {
-  // 问答块 ↔ 引用面板联动：点击任意历史问答块，右侧面板切换到该轮的引用
-  document.querySelectorAll("#chat-inner .a-block").forEach((b) => b.classList.remove("cur"));
-  block.classList.add("cur");
-  renderCites(citations || [], runId);
-}
-
 function fillGov(strip, runId) {
   const items = [
     "Guardrails 输入脱敏 · 已执行",
@@ -320,29 +363,19 @@ function fillGov(strip, runId) {
   strip.hidden = false;
 }
 
-function appendCiteRow(bodyEl, citations) {
-  if (!citations.length) return;
-  const row = document.createElement("div");
-  row.className = "cite-row";
-  row.innerHTML =
-    '<span class="cite-label">引用：</span>' +
-    citations.map((_, i) => `<span class="cite" data-c="${i + 1}">${i + 1}</span>`).join("");
-  bodyEl.appendChild(row);
-  bindCites(bodyEl);
-}
-
 function appendQuestion(inner, text) {
   const wrap = document.createElement("div");
   wrap.className = "q-bubble";
   wrap.innerHTML = `<div class="txt">${esc(text)}</div>`;
   inner.appendChild(wrap);
+  return wrap; // 供 POST 直播用落库文本（脱敏后）替换
 }
 
 function buildAnswerBlock(inner, runId) {
   const block = document.createElement("div");
   block.className = "a-block";
   block.innerHTML = `
-    <div class="a-head"><span class="who">知识助手</span><span class="meta">${runId ? "Run " + runId.slice(0, 8) : ""}</span></div>
+    <div class="a-head"><span class="who">${esc(agentName())}</span><span class="meta">${runId ? "Run " + runId.slice(0, 8) : ""}</span></div>
     <div class="a-body"><span class="empty-hint">正在检索知识库…</span></div>
     <div class="gov-strip" hidden></div>`;
   inner.appendChild(block);
@@ -351,48 +384,40 @@ function buildAnswerBlock(inner, runId) {
 
 async function openSession(sessionId) {
   state.currentSessionId = sessionId;
+  state.streamEpoch += 1; // 使旧会话流的断线重连失效
+  if (state.streamAbort) { state.streamAbort.abort(); state.streamAbort = null; }
+  state.hwEpoch += 1;     // 断开旧 harness events 流（Agent 分支稍后 startHwStream 重开）
+  if (state.hwAbort) { state.hwAbort.abort(); state.hwAbort = null; }
+  state.renderedSeqs = new Set();
+  state.seenSeq = 0;
+  state.pendingQuestion = null;
+  state.qaAnswer = "";
+  state.qaDoneSeq = 0;
   renderSessions();
   const inner = $("chat-inner");
   inner.innerHTML = "";
   try {
-    const runs = await api(`/sessions/${sessionId}/runs`);
-    const ordered = [...runs].reverse(); // API 降序 → 时间升序渲染
-    if (!ordered.length) {
-      inner.innerHTML = `<div class="chat-empty"><div class="t">向知识助手提问</div><div class="s">回答基于你有权访问的知识库生成，每条结论均可追溯引用来源</div></div>`;
-      renderCites([], null);
+    const session = state.sessions.find((x) => x.id === sessionId) || null;
+    state.currentProfile = session ? profileOf(session.profile_key) : null;
+    applyProfileChrome(); // chip/占位文案随会话绑定智能体切换（含刷新回放路径）
+    const p = currentProfileOf();
+    if (p && p.engine_kind !== "qa_graph") {
+      // Agent 会话：harness 渲染容器 + events 流（连接即 replay 本会话历史，按 traceId 过滤）
+      inner.innerHTML = '<div class="chat-stream" id="hw-stream"></div><div class="hw-approvals" id="hw-approvals"></div>';
+      resetHwSession();
+      startHwStream();
       return;
     }
-    let lastCitations = [];
-    let lastRunId = null;
-    let lastBlock = null;
-    for (const run of ordered) {
-      appendQuestion(inner, run.question);
-      const runId = run.id;
-      const block = buildAnswerBlock(inner, runId);
-      const body = block.querySelector(".a-body");
-      const cites = run.citations || [];
-      block.title = "点击查看该轮回答的引用来源";
-      block.addEventListener("click", () => highlightBlock(block, cites, runId));
-      if (run.status === "failed") {
-        body.classList.add("err");
-        body.innerHTML = `<p>本次回答执行失败：${esc(run.error || "未知错误")}</p>`;
-      } else if (run.answer) {
-        const p = document.createElement("p");
-        p.textContent = run.answer;
-        body.innerHTML = "";
-        body.appendChild(p);
-        lastCitations = cites;
-        lastRunId = runId;
-        lastBlock = block;
-        appendCiteRow(body, cites);
-        fillGov(block.querySelector(".gov-strip"), runId);
-      } else {
-        body.innerHTML = '<p class="empty-hint">（执行中或未产生回答）</p>';
-      }
+    // 消息信封回放（ADR-015 决策 5）：chat_messages 落库 = 重启/切会话重建聊天流的数据源
+    const body = await api(`/workbench/sessions/${sessionId}/messages?after_seq=0`);
+    if (!body.messages.length) {
+      inner.innerHTML = `<div class="chat-empty"><div class="t">向知识助手提问</div><div class="s">回答基于你有权访问的知识库生成</div></div>`;
+      applyProfileChrome(); // 按当前 Profile 覆写空态文案
+    } else {
+      for (const m of body.messages) renderEnvelope(m);
+      scrollBottom();
     }
-    renderCites(lastCitations, lastRunId);
-    if (lastBlock) lastBlock.classList.add("cur");
-    scrollBottom();
+    startSessionStream(sessionId); // 接入会话流：尾随直播新消息（含审批卡片）
   } catch (err) {
     toast(errText(err), true);
   }
@@ -410,12 +435,28 @@ async function sendQuestion() {
   const input = $("composer-input");
   const question = input.value.trim();
   if (!question) { toast("请输入问题", true); return; }
+  const profile = currentProfileOf();
+  const isAgent = Boolean(profile && profile.engine_kind !== "qa_graph");
+  if (isAgent) {
+    // runtime 引擎（harness 移植）：运行中点发送 = 中断当前 turn；发送走 harness /api/turn
+    if (state.hwBusy) { void cancelAgentTurn(); return; }
+    if (!state.currentSessionId) await newSession();
+    input.value = "";
+    await sendAgentTurn(question);
+    return;
+  }
   if (!state.currentSessionId) {
     try {
-      const s = await api("/sessions", { method: "POST", body: JSON.stringify({ title: question.slice(0, 20) }) });
+      const s = await api("/workbench/sessions", {
+        method: "POST",
+        body: JSON.stringify({ profile_key: state.profileKey, title: question.slice(0, 20) }),
+      });
       state.sessions.unshift(s);
       state.currentSessionId = s.id;
+      state.currentProfile = profileOf(s.profile_key);
+      applyProfileChrome();
       renderSessions();
+      startSessionStream(s.id);
     } catch (err) { toast(errText(err), true); return; }
   }
   if (state.sending) return;
@@ -424,41 +465,88 @@ async function sendQuestion() {
 
   const inner = $("chat-inner");
   inner.querySelector(".chat-empty") && inner.querySelector(".chat-empty").remove();
-  appendQuestion(inner, question);
+
+  // qa_graph 引擎：SSE 直播（text/delta/done/error 帧协议与原 /chat 一致）
+  const qEl = appendQuestion(inner, question); // 乐观气泡；user 帧到达后以落库文本（脱敏）替换
   const block = buildAnswerBlock(inner, null);
   const body = block.querySelector(".a-body");
+  body.classList.add("thinking"); // 首 delta 前保留「正在检索…」占位（CSS 点点动画）
   scrollBottom();
 
+  // 打字机：delta 只累积目标文本，渲染按固定速率追平——模型快吐也不瞬间满屏；
+  // done 后提速收尾（长回答不拖尾），错误/断流立即终止打字
   let answer = "";
-  const p = document.createElement("p");
-  body.innerHTML = "";
-  body.appendChild(p);
+  let shown = 0;
+  let typeChars = 4; // 每 tick 追平字符数（≈240 字/秒）
+  let donePending = null;
+  let p = null;
+  const ensureParagraph = () => {
+    if (!p) {
+      body.classList.remove("thinking");
+      body.innerHTML = "";
+      p = document.createElement("p");
+      body.appendChild(p);
+    }
+    return p;
+  };
+  const typer = setInterval(() => {
+    if (shown >= answer.length) {
+      if (donePending) {
+        clearInterval(typer);
+        const fn = donePending;
+        donePending = null;
+        fn();
+      }
+      return;
+    }
+    shown = Math.min(answer.length, shown + typeChars);
+    const el = ensureParagraph();
+    el.textContent = answer.slice(0, shown);
+    el.insertAdjacentHTML("beforeend", '<span class="caret"></span>');
+    scrollBottom();
+  }, 16);
+  const stopTyping = () => { clearInterval(typer); donePending = null; };
+
+  state.pendingQuestion = question; // 会话流重放本条 user 帧时去重
+  state.qaAnswer = "";
 
   const finish = (runId, citations, failed) => {
-    p.textContent = answer;
+    stopTyping();
+    const el = ensureParagraph();
+    el.textContent = answer;
     if (!answer) body.innerHTML = `<p class="empty-hint">${esc(failed || "未产生回答")}</p>`;
-    appendCiteRow(body, citations || []);
     fillGov(block.querySelector(".gov-strip"), runId);
     block.querySelector(".meta").textContent = runId ? "Run " + runId.slice(0, 8) : "";
-    highlightBlock(block, citations || [], runId);
     setSending(false);
     scrollBottom();
     loadSessions(); // 刷新会话列表顺序
   };
 
   try {
-    const res = await fetch(`/api/sessions/${state.currentSessionId}/chat`, {
+    const res = await fetch(`/api/workbench/sessions/${state.currentSessionId}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + state.token },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, model: state.qaModel || null }),
     });
-    if (res.status === 401) { logout(); return; }
+    if (res.status === 401) { stopTyping(); logout(); return; }
     if (!res.ok) {
       let detail = res.statusText;
       try { detail = (await res.json()).detail || detail; } catch { /* noop */ }
+      stopTyping();
       body.classList.add("err");
-      p.textContent = `提问失败：${res.status} ${detail}`;
+      ensureParagraph().textContent = `提问失败：${res.status} ${detail}`;
+      state.pendingQuestion = null;
       setSending(false);
+      return;
+    }
+    const ctype = res.headers.get("content-type") || "";
+    if (!ctype.includes("text/event-stream")) { // 防御：非流式响应按任务受理处理
+      stopTyping();
+      await res.json().catch(() => ({}));
+      toast("已受理为任务，进度将在会话流中呈现");
+      state.pendingQuestion = null;
+      setSending(false);
+      loadSessions();
       return;
     }
     const reader = res.body.getReader();
@@ -483,14 +571,28 @@ async function sendQuestion() {
         const frame = parseFrame(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
         if (!frame) continue;
-        if (frame.event === "delta") {
+        if (frame.event === "text") {
+          const env = frame.payload;
+          const d = (env && env.data) || {};
+          if (env && env.seq !== undefined) state.renderedSeqs.add(env.seq);
+          if (d.role === "user" && state.pendingQuestion !== null) {
+            // 以落库文本为准（含输入脱敏）：替换乐观气泡，敏感原文不驻留聊天流
+            qEl.querySelector(".txt").textContent = d.text;
+            state.pendingQuestion = null;
+          }
+        } else if (frame.event === "delta") {
           answer += frame.payload.text;
-          p.textContent = answer;
-          p.insertAdjacentHTML("beforeend", '<span class="caret"></span>');
-          scrollBottom();
+          state.qaAnswer = answer; // DOM 更新交给打字机节流
         } else if (frame.event === "done") {
-          finish(frame.payload.run_id, frame.payload.citations, null);
+          // assistant 信封 seq：会话流重放该帧时按已渲染去重
+          state.qaDoneSeq = frame.payload.seq || 0;
+          typeChars = 24; // 收尾提速：长回答不拖尾
+          const fn = () => finish(frame.payload.run_id, frame.payload.citations, null);
+          if (shown >= answer.length) fn();
+          else donePending = fn;
         } else if (frame.event === "error") {
+          if (frame.payload.user_seq) state.renderedSeqs.add(frame.payload.user_seq);
+          state.pendingQuestion = null;
           body.classList.add("err");
           finish(frame.payload.run_id || null, null, frame.payload.message);
         }
@@ -498,10 +600,1283 @@ async function sendQuestion() {
     }
     if (state.sending) finish(null, null, "连接中断");
   } catch (err) {
+    stopTyping();
     body.classList.add("err");
-    p.textContent = `连接异常：${errText(err)}`;
+    ensureParagraph().textContent = `连接异常：${errText(err)}`;
+    state.pendingQuestion = null;
     setSending(false);
   }
+}
+
+/* ============================================================
+   统一工作台（ADR-014~017 一期）：Profile 选择 · 消息信封渲染 · 会话流
+   ============================================================ */
+const AGENT_EVENT_LABEL = {
+  task_created: "任务已创建",
+  task_status: "任务状态",
+  tool_start: "工具调用",
+  tool_result: "工具结果",
+  check_start: "自动检查",
+  check_result: "检查结果",
+  verify: "独立验证",
+  summary: "交付摘要",
+  approval_resolved: "审批已处理",
+  out_of_bounds: "越界拦截",
+  redline_blocked: "红线拦截",
+  delta: "叙述",
+  error: "执行失败",
+};
+
+function profileOf(key) {
+  return state.profiles.find((p) => p.key === (key || "knowledge-assistant")) || null;
+}
+
+function agentName() {
+  const p = currentProfileOf();
+  return p ? p.display_name : "知识问答助手";
+}
+
+function currentProfileOf() {
+  // 会话优先：刷新回放时 profiles 可能晚于 openSession 到达，统一按会话绑定解析
+  if (state.currentSessionId) {
+    const s = state.sessions.find((x) => x.id === state.currentSessionId);
+    return s ? profileOf(s.profile_key) : state.currentProfile;
+  }
+  return profileOf(state.profileKey);
+}
+
+async function loadProfiles() {
+  if (!state.token) return;
+  try {
+    state.profiles = await api("/workbench/profiles");
+    renderSessions(); // 会话列表的智能体标记依赖 profiles
+    applyProfileChrome();
+  } catch (err) {
+    toast(errText(err), true);
+  }
+}
+
+function applyProfileChrome() {
+  const p = currentProfileOf();
+  const isAgent = Boolean(p && p.engine_kind !== "qa_graph");
+  const chip = $("agent-chip");
+  if (chip) chip.textContent = isAgent ? `🤖 ${p.display_name}` : "💬 智能问答";
+  const empty = document.querySelector("#chat-inner .chat-empty");
+  if (empty) {
+    empty.querySelector(".t").textContent = isAgent ? `向${p.display_name}下达任务` : "向知识助手提问";
+    empty.querySelector(".s").textContent = isAgent
+      ? "任务交由 Agent 执行：计划、工具卡片与审批都在本聊天流中完成"
+      : "回答基于你有权访问的知识库生成；右上角可切换智能体与模型";
+  }
+  $("composer-input").placeholder = isAgent ? `向${p.display_name}下达任务…（Enter 发送）` : "向知识助手提问…（Enter 发送）";
+  updateComposerMode();
+  updateModelChip();
+}
+
+// ---------- 消息信封渲染（回放与直播共用，全部幂等） ----------
+
+function renderEnvelope(m) {
+  if (m.seq !== undefined && state.renderedSeqs.has(m.seq)) return null;
+  if (m.seq !== undefined) {
+    state.renderedSeqs.add(m.seq);
+    if (m.seq > state.seenSeq) state.seenSeq = m.seq;
+  }
+  const d = m.data || {};
+  const inner = $("chat-inner");
+  inner.querySelector(".chat-empty") && inner.querySelector(".chat-empty").remove();
+  if (m.type === "text") {
+    if (d.role === "user") { appendQuestion(inner, d.text || ""); return null; }
+    return renderAssistantEnvelope(d);
+  }
+  if (m.type === "agent_event") { renderAgentEvent(d); return null; }
+  if (m.type === "approval_card") { renderApprovalCard(d); return null; }
+  return null;
+}
+
+function renderAssistantEnvelope(d) {
+  const block = buildAnswerBlock($("chat-inner"), null);
+  const body = block.querySelector(".a-body");
+  const p = document.createElement("p");
+  p.textContent = d.text || "";
+  body.innerHTML = "";
+  body.appendChild(p);
+  fillGov(block.querySelector(".gov-strip"), null);
+  scrollBottom();
+  return block;
+}
+
+function renderAgentEvent(d) {
+  // 桥接事件不带 event 字段（task_status data={status,note}、summary data={outcome,…}），按字段推断
+  const ev = d.event
+    || (d.status !== undefined ? "task_status"
+    : (d.outcome !== undefined ? "summary" : ""));
+  if (ev === "approval_resolved") markCardResolved(d); // 同步卡片为已决策（多端一致）
+  const warn = ev === "out_of_bounds" || ev === "redline_blocked" || ev === "error";
+  let detail = "";
+  if (ev === "task_status") detail = `${d.status || ""}${d.note ? " · " + d.note : ""}`;
+  else if (ev === "tool_start") detail = `${d.tool || ""}${d.args_preview ? " " + d.args_preview : ""}`;
+  else if (ev === "tool_result") detail = `${d.tool || ""} ${d.ok ? "完成" : "失败"}`;
+  else if (ev === "delta") detail = d.text || "";
+  else if (ev === "error") detail = d.error || "";
+  else if (ev === "summary") detail = `${d.outcome || ""}${d.steps !== undefined ? " · steps " + d.steps : ""}`;
+  else if (ev === "check_start" || ev === "check_result") detail = d.command || "";
+  else if (ev === "verify") detail = `${(d.criteria || []).length} 项判定`;
+  else detail = d.command || d.tool || d.note || "";
+  const label = AGENT_EVENT_LABEL[ev] || ev || "事件";
+  const el = document.createElement("div");
+  el.className = "evt-line" + (warn ? " warn" : "");
+  el.innerHTML = `<span class="evt-dot"></span><span class="evt-k">${esc(label)}</span>` +
+    `<span class="evt-d">${esc(String(detail).slice(0, 140))}</span>` +
+    (d.task_seq ? `<span class="evt-seq">#${d.task_seq}</span>` : "");
+  $("chat-inner").appendChild(el);
+}
+
+// ---------- 审批卡片（Q4A：按钮直接调既有 agentdesk 端点） ----------
+
+function settleCard(card, text) {
+  const actions = card.querySelector("[data-ap-actions]");
+  const done = card.querySelector("[data-ap-done]");
+  if (actions) actions.hidden = true;
+  if (done) {
+    done.hidden = false;
+    const t = card.querySelector("[data-ap-done-text]");
+    if (t) t.textContent = text;
+  }
+}
+
+function markCardResolved(d) {
+  if (!d.approval_id) return;
+  const card = document.querySelector(`[data-card-approval="${CSS.escape(String(d.approval_id))}"]`);
+  if (!card) return;
+  settleCard(
+    card,
+    d.decision === "deny" ? "已拒绝：Agent 停止执行该命令"
+      : d.decision === "always" ? "已允许：本项目后续同类命令免确认（已写入策略）"
+      : "已允许本次执行"
+  );
+}
+
+function renderApprovalCard(d) {
+  const inner = $("chat-inner");
+  const el = document.createElement("div");
+  el.className = "approval-card" + (d.kind === "plan_confirm" ? " plan-card" : "");
+  if (d.kind === "plan_confirm") {
+    // 计划确认卡片：确认后切自动执行 / 取消任务
+    el.dataset.cardTask = d.task_id;
+    const steps = (d.steps || []).map((s, i) => {
+      const title = typeof s === "string" ? s : (s.title || "");
+      const detail = typeof s === "string" ? "" : (s.detail || "");
+      return `<div class="ap-step"><span class="ap-idx">${String(i + 1).padStart(2, "0")}</span>` +
+        `<div><b>${esc(title)}</b>${detail ? `<br><span class="ap-detail">${esc(detail)}</span>` : ""}</div></div>`;
+    }).join("");
+    const risks = (d.risks || []).map((r) => `<div class="ap-risk">⚠ ${esc(r)}</div>`).join("");
+    el.innerHTML = `
+      <div class="ap-head"><b>执行计划</b><span class="ap-meta">${(d.steps || []).length} 步 · 待确认</span></div>
+      <div class="ap-body">${steps}${risks}</div>
+      <div class="ap-actions" data-ap-actions>
+        <button class="ap-btn primary" data-plan-action="approve">确认计划并执行</button>
+        <button class="ap-btn ghost" data-plan-action="cancel">取消任务</button>
+      </div>
+      <div class="ap-done" data-ap-done hidden><span data-ap-done-text></span></div>`;
+    el.querySelectorAll("[data-plan-action]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const action = btn.dataset.planAction;
+        try {
+          await api(`/agentdesk/tasks/${d.task_id}/plan/confirm`, {
+            method: "POST",
+            body: JSON.stringify({ action }),
+          });
+          settleCard(el, action === "approve" ? "计划已确认，任务继续执行" : "任务已取消");
+          toast(action === "approve" ? "已确认计划，任务继续执行" : "任务已取消");
+        } catch (err) {
+          toast(errText(err), true); // 重复确认/已推进 → 409
+        }
+      });
+    });
+  } else {
+    // 工具审批卡片：once / always / deny 三选
+    el.dataset.cardApproval = d.approval_id;
+    const [scopeTool, scopeLevel] = String(d.scope || "").split(":");
+    el.innerHTML = `
+      <div class="ap-head"><b>需要你确认</b><span class="ap-meta">${esc(scopeLevel || "")} ${esc(scopeTool || "")}</span></div>
+      <div class="ap-body">
+        <div class="ap-cmd"><span class="prompt">$</span>${esc(d.command || "")}</div>
+        <div class="ap-note">${esc(d.reason || "策略引擎要求人工审批。")}作用域：${esc(d.scope || "")}。</div>
+      </div>
+      <div class="ap-actions" data-ap-actions>
+        <button class="ap-btn primary" data-approve="once">仅本次允许</button>
+        <button class="ap-btn" data-approve="always">本项目总是允许</button>
+        <button class="ap-btn ghost" data-approve="deny">拒绝</button>
+      </div>
+      <div class="ap-done" data-ap-done hidden><span data-ap-done-text></span></div>`;
+    el.querySelectorAll("[data-approve]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const decision = btn.dataset.approve;
+        try {
+          await api(`/agentdesk/approvals/${d.approval_id}/decide`, {
+            method: "POST",
+            body: JSON.stringify({ decision }),
+          });
+          settleCard(el, decision === "deny" ? "已拒绝：Agent 停止执行该命令"
+            : decision === "always" ? "已允许：本项目后续同类命令免确认（已写入策略）"
+            : "已允许本次执行");
+          toast(decision === "deny" ? "已拒绝。Agent 将收到拒绝反馈并自纠"
+            : decision === "always" ? "已写入项目策略：同类命令免确认"
+            : "已允许本次命令");
+        } catch (err) {
+          toast(errText(err), true); // 双击/已被他端决策 → 409
+        }
+      });
+    });
+  }
+  inner.appendChild(el);
+}
+
+// ---------- 会话流：fetch SSE + Last-Event-ID 续传（无终态帧，断线自动重连） ----------
+
+function setStreamState(text, on) {
+  const el = $("stream-state");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("on", !!on);
+}
+
+async function startSessionStream(sessionId) {
+  state.streamEpoch += 1;
+  const epoch = state.streamEpoch;
+  state.streamAbort = new AbortController();
+  try {
+    const res = await fetch(`/api/workbench/sessions/${sessionId}/stream`, {
+      headers: {
+        Authorization: "Bearer " + state.token,
+        Accept: "text/event-stream",
+        ...(state.seenSeq > 0 ? { "Last-Event-ID": String(state.seenSeq) } : {}),
+      },
+      signal: state.streamAbort.signal,
+    });
+    if (!res.ok) {
+      if (res.status === 401) { logout(); return; }
+      setStreamState("SSE 未连接", false);
+      return;
+    }
+    setStreamState("SSE 已连接", true);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (epoch !== state.streamEpoch) return; // 已切换会话：丢弃旧流帧
+        onStreamFrame(frame);
+      }
+    }
+  } catch (err) {
+    if (err.name === "AbortError") return; // 主动切换会话/登出
+  }
+  // 会话流无终态帧（客户端断开收尾）：2s 后按 Last-Event-ID 续传
+  if (epoch === state.streamEpoch && state.token && $("view-app").classList.contains("active")) {
+    setStreamState("SSE 重连中…", false);
+    setTimeout(() => {
+      if (epoch === state.streamEpoch && state.token) startSessionStream(sessionId);
+    }, 2000);
+  }
+}
+
+function onStreamFrame(frame) {
+  let seq = null, type = "", payload = {};
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("id:")) seq = Number(line.slice(3).trim());
+    else if (line.startsWith("event:")) type = line.slice(6).trim();
+    else if (line.startsWith("data:")) {
+      try { payload = JSON.parse(line.slice(5).trim()); } catch { payload = {}; }
+    }
+  }
+  if (!type) return;
+  const m = {
+    seq: payload.seq !== undefined ? payload.seq : seq,
+    type,
+    data: payload.data || {},
+    task_id: payload.task_id || null,
+  };
+  // POST SSE 直播期间 user 帧由 POST 流通道渲染（乐观气泡 + 落库文本替换）；
+  // 落库文本可能已脱敏，与乐观原文不再相等，文本匹配去重不可靠 → sending 期间仅记账
+  if (m.type === "text" && m.data.role === "user" && state.sending) {
+    // 仅记账（帧尾统一 renderedSeqs），渲染归 POST 流通道
+  } else if (m.type === "text" && m.data.role === "assistant"
+    && (m.seq <= state.qaDoneSeq
+      || (state.sending && typeof state.qaAnswer === "string" && m.data.text === state.qaAnswer))) {
+    state.qaDoneSeq = Math.max(state.qaDoneSeq, m.seq || 0); // 同上
+  } else {
+    renderEnvelope(m);
+    scrollBottom();
+  }
+  if (m.seq !== undefined && !state.renderedSeqs.has(m.seq)) {
+    state.renderedSeqs.add(m.seq);
+    if (m.seq > state.seenSeq) state.seenSeq = m.seq;
+  }
+}
+
+/* ============================================================
+   Agent 内嵌（harness 渲染体系移植，ADR-019 后续）：
+   发送 → POST /api/harness/api/turn；事件经全局 SSE（/api/harness/api/events）按 traceId
+   过滤渲染到当前 Agent 会话（traceId ↔ platform 会话映射持久化于 zs_hw_traces）。
+   渲染器与类名沿用 harness（.turn/.msg/.plan-card/.wave/.tool-card/.perm-card），样式已移植本页；
+   markdown 渲染复用 harness/markdown.js（index.html module 桥挂 window.renderMarkdown）。
+   ============================================================ */
+
+const OUTPUT_PREVIEW_CHARS = 200;
+
+const REASON_LABELS = {
+  goal_completed: "完成",
+  max_iterations_reached: "达到迭代上限",
+  needs_user_decision: "需要用户决策",
+  guardrail_rejected: "护栏拒绝",
+  user_interrupted: "已中断",
+  error: "出错",
+};
+
+// ---------- 小工具（harness 同名移植） ----------
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+
+function nowLabel() {
+  return timeLabel(Date.now());
+}
+
+function timeLabel(timestamp) {
+  const d = new Date(timestamp);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatDuration(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Thinking 模型可能吐 <think> 块，聊天区不展示。 */
+function stripThink(text) {
+  let out = text.replace(/<think>[\s\S]*?<\/think>/g, "");
+  const open = out.lastIndexOf("<think>");
+  if (open !== -1) out = out.slice(0, open);
+  return out.replace(/^\s+/, "");
+}
+
+function oneLine(text, max) {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+/** markdown 渲染：优先 module 桥的全量转义渲染器，降级纯文本转义 */
+function renderMd(text) {
+  return typeof window.renderMarkdown === "function" ? window.renderMarkdown(text) : esc(text);
+}
+
+function scrollIfNearBottom() {
+  const sc = $("chat-scroll");
+  if (!sc) return;
+  const gap = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+  if (gap < 140) sc.scrollTop = sc.scrollHeight;
+}
+
+// ---------- 会话渲染状态（平台单会话容器 = 单 hwSession） ----------
+
+let hwSession = null;
+
+function resetHwSession() {
+  // 对齐 harness 原版语义（restoreTranscript）：replay 每次连接重推，重建前必须清空，
+  // 否则重连（如每次 sendAgentTurn 的幂等重连）会把已渲染的 turn 重复画一遍。
+  // 其余调用点（openSession/sendAgentTurn 容器重建分支）本就是空容器，清空为无害 no-op。
+  const stream = $("hw-stream");
+  if (stream) stream.replaceChildren();
+  hwSession = {
+    stream: $("hw-stream"),
+    turnGroup: null,
+    plan: null,
+    waves: new Map(),
+    cards: new Map(),
+    live: null,
+  };
+}
+
+/** 事件归属：已知 trace 按映射路由（跨会话串流防护）；未知/无 trace 事件仅跟随当前会话发起的运行中 turn */
+function hwSessionForTrace(traceId) {
+  if (!hwSession) return null;
+  const isLive = state.hwBusy && state.hwActiveSession === state.currentSessionId;
+  if (traceId) {
+    for (const [sid, set] of state.hwTraceIds) {
+      if (set.has(traceId)) return sid === state.currentSessionId ? hwSession : null;
+    }
+    return isLive ? hwSession : null; // 竞态：traceId 尚未登记（POST 响应未返回）但事件已到
+  }
+  return isLive ? hwSession : null; // user_message 等不带 traceId 的事件
+}
+
+function hwSessionForEvent(payload) {
+  return hwSessionForTrace(payload && payload.traceId);
+}
+
+// ---------- turn 组与消息渲染（harness 移植） ----------
+
+function ensureTurn(session) {
+  if (session.turnGroup) return session.turnGroup;
+  const group = el("div", "turn");
+  session.stream.append(group);
+  session.turnGroup = group;
+  session.plan = null;
+  session.waves.clear();
+  session.cards.clear();
+  session.live = null;
+  return group;
+}
+
+function addUserMessage(session, text) {
+  const group = ensureTurn(session);
+  const wrap = el("div", "msg user");
+  wrap.append(el("div", "msg-avatar", "你"));
+  const body = el("div", "msg-body");
+  const meta = el("div", "msg-meta");
+  meta.append(el("span", null, "你"), el("span", null, nowLabel()));
+  const content = el("div", "msg-content", text);
+  body.append(meta, content);
+  wrap.append(body);
+  group.append(wrap);
+  scrollIfNearBottom();
+}
+
+function addAgentBubble(session) {
+  const group = ensureTurn(session);
+  const wrap = el("div", "msg agent");
+  wrap.append(el("div", "msg-avatar", "A"));
+  const body = el("div", "msg-body");
+  const meta = el("div", "msg-meta");
+  meta.append(el("span", null, "Agent"), el("span", null, nowLabel()));
+  const content = el("div", "msg-content", "");
+  body.append(meta, content);
+  wrap.append(body);
+  group.append(wrap);
+  return { wrap, content, meta };
+}
+
+function addErrorNote(session, message) {
+  const note = el("div", "msg-error", message);
+  (session.turnGroup ?? ensureTurn(session)).append(note);
+}
+
+function onDelta(session, text) {
+  if (!session) return;
+  if (!session.live) session.live = { ...addAgentBubble(session), raw: "" };
+  session.live.raw += text;
+  session.live.content.innerHTML = renderMd(stripThink(session.live.raw));
+  scrollIfNearBottom();
+}
+
+function onAssistantMessage(session, text) {
+  if (!session) return;
+  const visible = stripThink(text);
+  if (visible) {
+    const bubble = session.live ?? addAgentBubble(session);
+    bubble.content.innerHTML = renderMd(visible);
+    session.live = null;
+  } else if (session.live) {
+    session.live.wrap.remove();
+    session.live = null;
+  }
+  scrollIfNearBottom();
+}
+
+// ---------- 计划卡（源自 runtime 真实 wave 调度） ----------
+
+function setStep(step, stepState) {
+  step.state = stepState;
+  step.row.className = `plan-step ${stepState}`;
+  step.check.className = `step-check ${stepState}`;
+  step.check.textContent = stepState === "done" ? "✓" : stepState === "running" ? "…" : "•";
+}
+
+function addPlanStep(plan, text) {
+  const row = el("div", "plan-step");
+  const check = el("div", "step-check todo", "•");
+  const label = el("div", "step-text", text);
+  const count = el("div", "step-count", "");
+  row.append(check, label, count);
+  plan.list.append(row);
+  const step = { row, check, label, count, state: "todo" };
+  plan.steps.push(step); // 登记：finishPlan 依此收尾 running 步骤
+  return step;
+}
+
+function ensurePlan(session) {
+  if (session.plan) return session.plan;
+  const group = ensureTurn(session);
+  const card = el("div", "plan-card");
+  card.append(el("h4", null, "🗺️ 本轮执行计划"));
+  const list = el("div");
+  card.append(list);
+  group.append(card);
+  const plan = { card, list, steps: [], reasoning: null, waveSteps: new Map() };
+  plan.reasoning = addPlanStep(plan, "模型推理 · 决策下一步动作");
+  setStep(plan.reasoning, "running");
+  session.plan = plan;
+  return plan;
+}
+
+function finishPlan(session) {
+  const plan = session.plan;
+  if (!plan) return;
+  for (const step of plan.steps) if (step.state === "running") setStep(step, "done");
+}
+
+// ---------- Wave 与工具卡 ----------
+
+function waveGroup(session, wave, parallel) {
+  const existing = session.waves.get(wave);
+  if (existing) return existing;
+
+  const group = ensureTurn(session);
+  const plan = ensurePlan(session);
+  if (plan.reasoning && plan.reasoning.state === "running") setStep(plan.reasoning, "done");
+
+  // 默认折叠：一条安静的摘要行；点击展开工具卡片
+  const summary = el("button", "wave-summary running", "");
+  summary.type = "button";
+  summary.addEventListener("click", () => {
+    body.hidden = !body.hidden;
+    summary.classList.toggle("open", !body.hidden);
+  });
+
+  const label = el(
+    "div",
+    "wave-label",
+    `${parallel ? "⚡" : "🔒"} Wave ${wave + 1} — ${parallel ? "并行（并行安全工具）" : "串行（含破坏性/外部工具）"}`,
+  );
+  const row = el("div", "wave");
+  const body = el("div", "wave-body");
+  body.hidden = true;
+  body.append(label, row);
+  group.append(summary, body);
+
+  const step = addPlanStep(plan, `${parallel ? "⚡" : "🔒"} Wave ${wave + 1}`);
+  setStep(step, "running");
+  step.count.textContent = "0 个工具";
+
+  const entry = { label, row, body, summary, parallel, calls: 0, done: 0, step, failed: 0, msTotal: 0 };
+  session.waves.set(wave, entry);
+  plan.waveSteps.set(wave, step);
+  updateWaveSummary(entry);
+  return entry;
+}
+
+/** 折叠摘要行保持最新：进度 → 结果（+ 耗时） */
+function updateWaveSummary(entry) {
+  const parts = [`⚙ ${entry.done}/${entry.calls} 个工具`];
+  if (entry.done < entry.calls) parts.push("运行中…");
+  else if (entry.failed > 0) parts.push(`${entry.failed} 个失败`);
+  else parts.push("全部 OK");
+  if (entry.msTotal > 0) parts.push(formatDuration(entry.msTotal));
+  entry.summary.textContent = parts.join(" · ");
+  entry.summary.classList.toggle("running", entry.done < entry.calls);
+  entry.summary.classList.toggle("has-error", entry.failed > 0);
+}
+
+function addToolCard(session, event) {
+  const group = waveGroup(session, event.wave, event.parallel);
+  group.calls++;
+  group.step.count.textContent = `${group.done}/${group.calls} 个工具`;
+
+  const card = el("div", "tool-card");
+  card.dataset.callId = event.callId;
+
+  const header = el("div", "tool-card-header");
+  header.append(
+    el("span", `wave-badge ${event.parallel ? "par" : "ser"}`, `${event.parallel ? "⚡" : "🔒"}W${event.wave + 1}`),
+    el("span", "tool-name", event.tool),
+  );
+  const status = el("span", "tool-status running", "RUNNING");
+  const duration = el("span", "tool-dur", "");
+  header.append(status, duration);
+
+  const input = el("div", "tool-input", "");
+  const toggle = el("button", "tool-output-toggle", "输出");
+  toggle.type = "button";
+  toggle.hidden = true;
+  const output = el("pre", "tool-output", "");
+  output.hidden = true;
+
+  toggle.addEventListener("click", () => {
+    output.hidden = !output.hidden;
+    if (!output.hidden) output.scrollTop = 0;
+  });
+
+  card.append(header, input, toggle, output);
+  group.row.append(card);
+  session.cards.set(event.callId, { card, status, duration, input, toggle, output, group });
+  updateWaveSummary(group);
+  scrollIfNearBottom();
+}
+
+function setToolInput(session, callId, text) {
+  const card = session.cards.get(callId);
+  if (!card) return;
+  card.input.textContent = `入参 ${text}`;
+}
+
+function finishToolCall(session, event) {
+  const card = session.cards.get(event.callId);
+  if (!card) return;
+  const status = String(event.status || "error").toLowerCase();
+  card.status.className = `tool-status ${status}`;
+  card.status.textContent = status === "ok" ? "OK" : status === "denied" ? "DENIED" : status === "timeout" ? "TIMEOUT" : "ERROR";
+  card.duration.textContent = formatDuration(event.durationMs);
+
+  card.group.done++;
+  if (status !== "ok") card.group.failed++;
+  card.group.msTotal += Number(event.durationMs) || 0;
+  card.group.step.count.textContent = `${card.group.done}/${card.group.calls} 个工具`;
+  if (card.group.done >= card.group.calls) setStep(card.group.step, "done");
+  updateWaveSummary(card.group);
+}
+
+function setToolOutput(session, event) {
+  const card = session.cards.get(event.callId);
+  if (!card) return;
+  const text = String(event.output ?? "");
+  const preview = text.slice(0, OUTPUT_PREVIEW_CHARS);
+  card.output.textContent = text.length > OUTPUT_PREVIEW_CHARS ? `${preview}\n…（共 ${text.length} 字符）` : preview;
+  card.toggle.hidden = false;
+  card.toggle.textContent = text.length > OUTPUT_PREVIEW_CHARS
+    ? `输出（前 ${OUTPUT_PREVIEW_CHARS} 字 / 共 ${text.length} 字）`
+    : `输出（${text.length} 字）`;
+}
+
+// ---------- turn 生命周期 ----------
+
+function onTurnFinished(payload, session) {
+  const s = session ?? hwSessionForEvent(payload);
+  if (s && s.turnGroup) {
+    const footer = el("div", "turn-footer");
+    footer.append(
+      el("b", null, REASON_LABELS[payload.reason] ?? payload.reason ?? "结束"),
+      el("span", null, `${payload.iterations ?? 0} iterations`),
+      el("span", null, formatDuration(payload.durationMs)),
+    );
+    if (payload.reason === "error" && payload.text) {
+      footer.append(el("span", null, oneLine(payload.text, 100)));
+    }
+    s.turnGroup.append(footer);
+    finishPlan(s);
+    s.turnGroup = null;
+    s.plan = null;
+    s.waves = new Map();
+    s.cards = new Map();
+    s.live = null;
+  }
+  state.hwBusy = false;
+  updateComposerMode();
+  scrollIfNearBottom();
+}
+
+// ---------- SSE 事件入口 ----------
+
+function onHwSessionEvent(event) {
+  if (!event || typeof event.type !== "string") return;
+  const session = hwSessionForEvent(event);
+  if (!session) return;
+  switch (event.type) {
+    case "user_message":
+      // 用户气泡由服务端事件渲染（回放安全），sendAgentTurn 不本地画
+      addUserMessage(session, event.text ?? "");
+      break;
+    case "turn_started": {
+      const group = ensureTurn(session);
+      const marker = el("div", "turn-marker", `TURN · trace ${String(event.traceId || "").slice(0, 8)}`);
+      group.prepend(marker);
+      break;
+    }
+    case "phase_changed":
+      break; // 平台版无 Turn 状态机面板
+    case "message_appended": {
+      if (!event.message || event.message.role !== "assistant") break;
+      const text = (event.message.content || [])
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("");
+      onAssistantMessage(session, text);
+      break;
+    }
+    case "tool_call_started":
+      addToolCard(session, event);
+      break;
+    case "tool_call_finished":
+      finishToolCall(session, event);
+      break;
+    case "compaction_triggered":
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * 从服务端 transcript 重建聊天流（SSE "replay"，每次连接重推）：
+ * entries 是全部 trace 的事件流，而 user_message 等事件不带 traceId——
+ * 用 turn_started.traceId 作游标：仅渲染属于当前会话（traceId ∈ 映射集合）的 turn 区段。
+ */
+function restoreHwTranscript(entries) {
+  if (!hwSession) return;
+  resetHwSession();
+  const set = state.hwTraceIds.get(state.currentSessionId);
+  if (!set) {
+    // 映射丢失（跨浏览器/清存储）：历史不可回放，仅提示，不阻塞新对话
+    addErrorNote(hwSession, "该会话的历史在本浏览器没有回放索引（traceId 映射丢失），不影响继续对话");
+    return;
+  }
+  let gate = false; // 游标：turn 结束后关闭，等待下一个 turn_started 重新判定归属
+  for (const entry of entries) {
+    if (!entry || typeof entry.kind !== "string") continue;
+    if (entry.kind === "session") {
+      const ev = entry.payload || {};
+      if (ev.type === "turn_started") {
+        gate = Boolean(ev.traceId && set.has(ev.traceId));
+        if (gate) onHwSessionEvent(ev);
+        continue;
+      }
+      if (gate) onHwSessionEvent(ev);
+    } else if (gate) {
+      if (entry.kind === "tool_input") setToolInput(hwSession, entry.payload?.callId, entry.payload?.input ?? "");
+      else if (entry.kind === "tool_result") setToolOutput(hwSession, entry.payload);
+      else if (entry.kind === "turn") { onTurnFinished(entry.payload, hwSession); gate = false; }
+    }
+  }
+  scrollBottom();
+}
+
+// ---------- harness events SSE（fetch 流式 + 指数退避重连，epoch 保护） ----------
+
+function startHwStream() {
+  state.hwEpoch += 1;
+  const epoch = state.hwEpoch;
+  if (state.hwAbort) state.hwAbort.abort();
+  const controller = new AbortController();
+  state.hwAbort = controller;
+  setStreamState("Agent 流连接中…", false);
+  void (async () => {
+    let attempts = 0;
+    while (epoch === state.hwEpoch && state.token) {
+      try {
+        const res = await fetch("/api/harness/api/events", {
+          headers: { Accept: "text/event-stream", Authorization: "Bearer " + state.token },
+          signal: controller.signal,
+        });
+        if (res.status === 401) { logout(); return; }
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        attempts = 0;
+        setStreamState("Agent 流已连接", true);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf("\n\n")) >= 0) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            if (epoch !== state.hwEpoch) return; // 已切换会话/登出：丢弃旧流帧
+            dispatchHwFrame(frame);
+          }
+        }
+      } catch (err) {
+        if (err.name === "AbortError") return; // 主动切换会话/登出
+      }
+      if (epoch !== state.hwEpoch || !state.token) return;
+      attempts += 1;
+      if (attempts > 5) { setStreamState("Agent 流断开", false); return; }
+      setStreamState("Agent 流重连中…", false);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(8000, 500 * 2 ** attempts)));
+    }
+  })();
+}
+
+// 原生 EventSource addEventListener 的等价分发表（fetch 流式无事件名 API）
+const HW_SSE_HANDLERS = {
+  replay: (payload) => {
+    if (Array.isArray(payload) && payload.length) restoreHwTranscript(payload);
+  },
+  state: (payload) => {
+    if (payload) applyHwState(payload);
+  },
+  session: (payload) => {
+    if (payload) onHwSessionEvent(payload);
+  },
+  delta: (payload) => {
+    const session = hwSessionForEvent(payload);
+    if (payload && session) onDelta(session, payload.text ?? "");
+  },
+  tool_input: (payload) => {
+    const session = hwSessionForEvent(payload);
+    if (payload && session) setToolInput(session, payload.callId, payload.input ?? "");
+  },
+  tool_result: (payload) => {
+    const session = hwSessionForEvent(payload);
+    if (payload && session) setToolOutput(session, payload);
+  },
+  approval: () => { /* 审批卡片随 state 快照渲染 */ },
+  approval_resolved: () => { /* 同上 */ },
+  turn: (payload) => {
+    if (payload) onTurnFinished(payload);
+  },
+  compaction: () => { /* 平台版无压缩提示面板 */ },
+};
+
+function dispatchHwFrame(frame) {
+  let name = "message";
+  const dataLines = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue; // 心跳/注释行
+    if (line.startsWith("event:")) name = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  const handler = HW_SSE_HANDLERS[name];
+  if (!handler) return;
+  const raw = dataLines.join("\n");
+  let payload = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch { payload = null; }
+  handler(payload);
+}
+
+/** harness 派生快照：仅取平台版关心的字段（忙碌/模型/审批） */
+function applyHwState(snapshot) {
+  if (!hwSession) return; // 非 Agent 会话不消费 harness 状态
+  state.hwBusy = Boolean(snapshot.busy);
+  if (snapshot.health && snapshot.health.model) {
+    state.hwModel = snapshot.health.model;
+    updateModelChip();
+  }
+  renderHwApprovals(snapshot.approvals);
+  updateComposerMode();
+}
+
+// ---------- 审批卡片（渲染于聊天流下方常驻区，POST /api/harness/api/approve） ----------
+
+function renderHwApprovals(approvals) {
+  const box = $("hw-approvals");
+  if (!box) return;
+  box.replaceChildren();
+  const list = approvals ?? [];
+  for (const approval of list) {
+    const card = el("div", "perm-card");
+    card.append(el("div", "perm-title", `⚠️ ${approval.level} 操作请求`));
+    const cmd = el("div", "perm-cmd");
+    cmd.append(el("div", null, approval.tool));
+    cmd.append(el("div", "perm-input", approval.input || "(无入参)"));
+    card.append(cmd);
+    const buttons = el("div", "perm-btns");
+    const allow = el("button", "btn primary", "✓ 允许");
+    const always = el("button", "btn always", "总是允许");
+    const deny = el("button", "btn danger", "✕ 拒绝");
+    for (const btn of [allow, always, deny]) btn.type = "button";
+    allow.addEventListener("click", () => void hwDecide(approval.requestId, "allowed", buttons));
+    always.addEventListener("click", () => void hwDecide(approval.requestId, "always", buttons));
+    deny.addEventListener("click", () => void hwDecide(approval.requestId, "denied", buttons));
+    buttons.append(allow, always, deny);
+    card.append(buttons);
+    box.append(card);
+  }
+}
+
+async function hwDecide(requestId, decision, buttons) {
+  for (const btn of buttons.querySelectorAll("button")) btn.disabled = true;
+  try {
+    const res = await hwFetch("/api/approve", {
+      method: "POST",
+      body: JSON.stringify({ requestId, decision }),
+    });
+    if (!res.ok) {
+      const payload = await res.json().catch(() => ({}));
+      toast((payload && payload.error && payload.error.message) || `审批失败（HTTP ${res.status}）`, true);
+    }
+  } catch {
+    toast("审批请求发送失败", true);
+  }
+}
+
+// ---------- 发送与中断（POST /api/harness/api/turn · /api/cancel） ----------
+
+async function sendAgentTurn(text) {
+  // 容器保障：newSession 后未经 openSession 直接发送时补建（含移除空态占位）
+  if (!$("hw-stream")) {
+    $("chat-inner").innerHTML = '<div class="chat-stream" id="hw-stream"></div><div class="hw-approvals" id="hw-approvals"></div>';
+  }
+  if (!hwSession || hwSession.stream !== $("hw-stream")) resetHwSession();
+  startHwStream(); // 事件流保障：newSession 直发路径无人启动过全局 SSE（已连接则幂等重连，replay 重建渲染）
+  state.hwActiveSession = state.currentSessionId;
+  state.hwBusy = true;
+  updateComposerMode();
+  scrollIfNearBottom();
+  try {
+    const res = await hwFetch("/api/turn", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const message = (payload && payload.error && payload.error.message) || `发送失败（HTTP ${res.status}）`;
+      addErrorNote(hwSession, message);
+      toast(message, true);
+      state.hwBusy = false;
+      updateComposerMode();
+      return;
+    }
+    // 绑定本 turn 与 platform 会话：replay 与 live 事件都按 traceId 归属
+    if (payload && payload.traceId) {
+      const set = state.hwTraceIds.get(state.currentSessionId) || new Set();
+      set.add(payload.traceId);
+      state.hwTraceIds.set(state.currentSessionId, set);
+      persistHwTraces();
+    } else {
+      // 静默吞掉会让“刷新后回放失效”变成无头案：至少留一条可查的痕迹
+      console.warn("[hw-turn] 响应无 traceId，未注册：", JSON.stringify(payload).slice(0, 120));
+    }
+  } catch {
+    addErrorNote(hwSession, "无法连接 Agent runtime");
+    toast("无法连接 Agent runtime", true);
+    state.hwBusy = false;
+    updateComposerMode();
+  }
+}
+
+async function cancelAgentTurn() {
+  try {
+    const res = await hwFetch("/api/cancel", { method: "POST", body: "{}" });
+    const payload = await res.json().catch(() => ({}));
+    if (res.status === 501) {
+      toast("当前 runtime 尚未提供中断能力，turn 会继续执行", true);
+      return;
+    }
+    if (!res.ok) {
+      toast((payload && payload.error && payload.error.message) || `中断失败（HTTP ${res.status}）`, true);
+      return;
+    }
+    toast(payload.cancelled ? "已请求中断" : "当前没有运行中的 turn");
+  } catch {
+    toast("中断请求发送失败", true);
+  }
+}
+
+// ---------- chip 与发送按钮模式 ----------
+
+function updateModelChip() {
+  const chip = $("model-chip");
+  if (!chip) return;
+  const p = currentProfileOf();
+  if (p && p.engine_kind !== "qa_graph") {
+    chip.textContent = state.hwModel ? `模型：${state.hwModel}` : "模型：—";
+  } else {
+    chip.textContent = state.qaModel ? `模型：${state.qaModel}` : "模型：平台默认";
+  }
+}
+
+function updateComposerMode() {
+  const btn = $("send-btn");
+  if (!btn) return;
+  const p = currentProfileOf();
+  const isAgent = Boolean(p && p.engine_kind !== "qa_graph");
+  if (isAgent && state.hwBusy) {
+    btn.disabled = false;
+    btn.textContent = "■ 中断";
+    btn.title = "中断当前 turn";
+  } else {
+    btn.textContent = "发 送";
+    btn.title = "发送（Enter）";
+    btn.disabled = state.sending;
+  }
+}
+
+// ---------- 模型选择器（移植 harness toggleModelPicker/switchModel/custom 管理） ----------
+// 数据源：GET /api/harness/api/models（+ state 快照 health）；
+// 切换按模式路由：问答模式记录到 localStorage 并随 send_message 透传（后端链首覆盖，fallback 链保留）；
+// Agent 模式 POST /api/harness/api/model（runtime 热切换，对话保留）。
+
+let modelPicker = null;
+let modelPickerCloser = null;
+
+function closeModelPicker(clickEvent) {
+  if (modelPicker && clickEvent && modelPicker.contains(clickEvent.target)) return;
+  if (modelPicker) modelPicker.remove();
+  modelPicker = null;
+  if (modelPickerCloser) document.removeEventListener("click", modelPickerCloser);
+  modelPickerCloser = null;
+}
+
+async function toggleModelPicker(editEntry = null) {
+  if (modelPicker && !editEntry) {
+    closeModelPicker();
+    return;
+  }
+  let data;
+  try {
+    const res = await hwFetch("/api/models");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    toast(`获取模型列表失败：${errText(err)}`, true);
+    return;
+  }
+
+  const p = currentProfileOf();
+  const isAgent = Boolean(p && p.engine_kind !== "qa_graph");
+  const currentName = isAgent ? (data.current || state.hwModel) : (state.qaModel || "");
+
+  const panel = el("div", "model-picker");
+  panel.append(el("div", "model-picker-title", isAgent ? "选择模型（Agent runtime）" : "选择模型（智能问答）"));
+  const FORMAT_LABELS = { "chat-completions": "Chat", "anthropic-messages": "Anthropic", "responses": "Responses" };
+  for (const m of data.models ?? []) {
+    const item = el("div", `model-item${m.model === currentName ? " current" : ""}`);
+    const main = el("button", "model-item-main");
+    main.type = "button";
+    main.append(el("span", "model-name", m.model));
+    const metaParts = [m.provider, m.custom ? `线上 · ${FORMAT_LABELS[m.apiFormat] ?? "Chat"}` : (m.declared ? "" : "自动发现")].filter(Boolean);
+    main.append(el("span", "model-meta", metaParts.join(" · ")));
+    if (m.model === currentName) main.disabled = true;
+    main.addEventListener("click", () => void switchModel(m.model));
+    item.append(main);
+    if (m.custom) {
+      const edit = el("button", "model-item-del", "✎");
+      edit.type = "button";
+      edit.title = `编辑线上模型 ${m.model}（URL / Key / API 格式 / 模型 ID / 上下文）`;
+      edit.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeModelPicker();
+        void toggleModelPicker({ ...m, isEdit: true });
+      });
+      item.append(edit);
+      const del = el("button", "model-item-del", "✕");
+      del.type = "button";
+      del.title = `删除线上模型 ${m.model}（provider: ${m.provider}）`;
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void removeCustomModel(m.provider);
+      });
+      item.append(del);
+    }
+    panel.append(item);
+  }
+  panel.append(buildCustomModelForm(editEntry));
+
+  document.body.append(panel);
+  const chip = $("model-chip");
+  const rect = chip.getBoundingClientRect();
+  panel.style.top = `${rect.bottom + 6}px`;
+  panel.style.right = `${Math.max(8, window.innerWidth - rect.right)}px`;
+  modelPicker = panel;
+  modelPickerCloser = closeModelPicker;
+  setTimeout(() => document.addEventListener("click", modelPickerCloser), 0);
+}
+
+async function switchModel(name) {
+  closeModelPicker();
+  const p = currentProfileOf();
+  if (!p || p.engine_kind === "qa_graph") {
+    // 问答模式：会话级覆盖——localStorage 记忆 + send_message 透传（随下一次提问生效）
+    state.qaModel = name;
+    localStorage.setItem("zs_qa_model", name);
+    updateModelChip();
+    toast(`问答模型已切换：${name}`);
+    return;
+  }
+  toast(`切换模型到 ${name} …`);
+  try {
+    const res = await hwFetch("/api/model", {
+      method: "POST",
+      body: JSON.stringify({ model: name }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((body && body.error && body.error.message) || `HTTP ${res.status}`);
+    state.hwModel = body.model || name;
+    updateModelChip();
+    toast(`✓ 已切换到 ${state.hwModel}（对话已保留）`);
+    // 服务端随后经 SSE 推送新的 state 快照，chip 会自动校准
+  } catch (err) {
+    toast(`切换失败：${errText(err)}`, true);
+  }
+}
+
+/** 「添加线上模型」表单；editEntry 非空时进入编辑模式（apiKey 留空保持原 Key） */
+function buildCustomModelForm(editEntry = null) {
+  const isEdit = Boolean(editEntry && editEntry.isEdit);
+  const wrap = el("div", "mp-custom");
+  const addBtn = el("button", "mp-custom-toggle", isEdit ? `✎ 编辑「${editEntry.provider}」` : "➕ 添加线上模型");
+  addBtn.type = "button";
+  addBtn.title = isEdit
+    ? `正在编辑线上模型 ${editEntry.provider}（API Key 留空则保持不变）`
+    : "添加线上模型（自定义 URL / API Key / API 格式 / 模型 ID / 上下文长度）";
+  const form = el("div", "mp-custom-form");
+  form.hidden = !isEdit; // 新增默认折叠；编辑模式保持展开
+  const toggleIcon = () => (form.hidden ? "▸" : "▾");
+
+  const field = (labelText, placeholder, opts = {}) => {
+    const label = el("label", "mp-field");
+    label.append(el("span", "mp-field-label", labelText + (opts.optional ? "（可选）" : "")));
+    const input = el("input", "mp-input");
+    input.type = opts.secret ? "password" : "text";
+    input.placeholder = placeholder;
+    if (opts.value) input.value = opts.value;
+    label.append(input);
+    return { label, input };
+  };
+
+  const e = editEntry || {};
+  const name = field("名称", "如 deepseek（留空则用模型 ID）", { optional: true, value: isEdit ? e.provider : "" });
+  const url = field("Base URL", "https://api.deepseek.com（或含 /v1）", { value: isEdit ? e.baseUrl : "" });
+  const key = field("API Key", isEdit ? "留空保持原 Key 不变" : "sk-…（本地代理可留空）", { optional: true, secret: true });
+  const model = field("模型 ID", "如 deepseek-chat", { value: isEdit ? e.model : "" });
+  const ctx = field("上下文长度", "tokens，如 65536（留空默认 32768）", { optional: true, value: isEdit && e.contextWindow ? String(e.contextWindow) : "" });
+
+  // 三种 API wire format，同一 OpenAI 兼容 Base URL 字段
+  const fmtLabel = el("label", "mp-field");
+  fmtLabel.append(el("span", "mp-field-label", "API 格式"));
+  const fmtSel = el("select", "mp-input mp-select");
+  const fmtOptions = [
+    ["chat-completions", "Chat Completions（/chat/completions）"],
+    ["anthropic-messages", "Anthropic Messages（/v1/messages）"],
+    ["responses", "Responses（/responses）"],
+  ];
+  for (const [value, text] of fmtOptions) {
+    const opt = el("option");
+    opt.value = value;
+    opt.textContent = text;
+    fmtSel.append(opt);
+  }
+  if (isEdit && e.apiFormat) fmtSel.value = e.apiFormat;
+  fmtLabel.append(fmtSel);
+  form.append(name.label, url.label, key.label, model.label, fmtLabel, ctx.label);
+
+  const errLine = el("div", "mp-error");
+  const submit = el("button", "mp-submit", isEdit ? "保存修改" : "保存并加入列表");
+  submit.type = "button";
+  submit.addEventListener("click", async () => {
+    errLine.textContent = "";
+    submit.disabled = true;
+    submit.textContent = "保存中…";
+    try {
+      const payload = {
+        name: name.input.value.trim(),
+        url: url.input.value.trim(),
+        apiKey: key.input.value.trim(),
+        model: model.input.value.trim(),
+        context: Number(ctx.input.value) || undefined,
+        apiFormat: fmtSel.value,
+      };
+      const endpoint = isEdit ? "/api/models/custom/update" : "/api/models/custom";
+      if (isEdit) payload.provider = e.provider;
+      const res = await hwFetch(endpoint, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((body && body.error && body.error.message) || `HTTP ${res.status}`);
+      toast(isEdit ? `✓ 已修改 ${body.model}（provider: ${body.provider}）` : `✓ 已添加 ${body.model}，点击列表即可切换`);
+      closeModelPicker();
+      void toggleModelPicker(); // 重开以展示最新列表
+    } catch (err) {
+      errLine.textContent = errText(err);
+    } finally {
+      submit.disabled = false;
+      submit.textContent = isEdit ? "保存修改" : "保存并加入列表";
+    }
+  });
+  form.append(errLine, submit);
+
+  addBtn.addEventListener("click", () => {
+    form.hidden = !form.hidden;
+    addBtn.textContent = `${toggleIcon()} ${form.hidden ? (isEdit ? `编辑「${e.provider}」` : "添加线上模型") : "收起表单"}`;
+    if (!form.hidden) (isEdit ? name : url).input.focus();
+  });
+  // 表单 hidden 定型后同步初始箭头
+  addBtn.textContent = `${toggleIcon()} ${form.hidden ? (isEdit ? `编辑「${e.provider}」` : "添加线上模型") : "收起表单"}`;
+
+  wrap.append(addBtn, form);
+  return wrap;
+}
+
+/** 按 provider 删除线上模型，然后刷新已打开的选择器 */
+async function removeCustomModel(provider) {
+  if (!confirm(`删除线上模型「${provider}」？\n\n仅移除本工具中的接入配置，不影响服务商账号。`)) return;
+  try {
+    const res = await hwFetch("/api/models/custom/remove", {
+      method: "POST",
+      body: JSON.stringify({ provider }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((body && body.error && body.error.message) || `HTTP ${res.status}`);
+    toast(`✓ 已删除 ${provider}`);
+    closeModelPicker();
+    void toggleModelPicker();
+  } catch (err) {
+    toast(`删除失败：${errText(err)}`, true);
+  }
+}
+
+// ---------- 智能体选择器（agent chip：列出 profiles；选择 = 开新会话，Q3A 语义不变） ----------
+
+let agentPicker = null;
+let agentPickerCloser = null;
+
+function closeAgentPicker(clickEvent) {
+  if (agentPicker && clickEvent && agentPicker.contains(clickEvent.target)) return;
+  if (agentPicker) agentPicker.remove();
+  agentPicker = null;
+  if (agentPickerCloser) document.removeEventListener("click", agentPickerCloser);
+  agentPickerCloser = null;
+}
+
+function toggleAgentPicker() {
+  if (agentPicker) {
+    closeAgentPicker();
+    return;
+  }
+  const panel = el("div", "model-picker");
+  panel.append(el("div", "model-picker-title", "选择智能体"));
+  const cur = currentProfileOf();
+  const currentKey = (cur || profileOf(state.profileKey) || {}).key || "knowledge-assistant";
+  for (const p of state.profiles) {
+    const isAgent = p.engine_kind !== "qa_graph";
+    const active = p.key === currentKey;
+    const item = el("div", `model-item${active ? " current" : ""}`);
+    const main = el("button", "model-item-main");
+    main.type = "button";
+    main.append(el("span", "model-name", isAgent ? `🤖 ${p.display_name}` : "💬 智能问答"));
+    main.append(el("span", "model-meta", p.description || (isAgent ? "Agent 任务执行" : "知识库问答（默认）")));
+    if (active) main.disabled = true; // 当前会话已绑定该智能体
+    main.addEventListener("click", () => {
+      closeAgentPicker();
+      if (active) return;
+      state.profileKey = p.key; // 新会话绑定所选智能体
+      void newSession();
+    });
+    item.append(main);
+    panel.append(item);
+  }
+  document.body.append(panel);
+  const chip = $("agent-chip");
+  const rect = chip.getBoundingClientRect();
+  panel.style.top = `${rect.bottom + 6}px`;
+  panel.style.left = `${Math.max(8, rect.left)}px`;
+  agentPicker = panel;
+  agentPickerCloser = closeAgentPicker;
+  setTimeout(() => document.addEventListener("click", agentPickerCloser), 0);
 }
 
 /* ============================================================
@@ -927,6 +2302,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("oidc-link").addEventListener("click", () => toast("SSO 对接为阶段二能力（OIDC 预留）", true));
   $("logout-btn").addEventListener("click", logout);
   $("new-conv-btn").addEventListener("click", newSession);
+  $("agent-chip").addEventListener("click", () => void toggleAgentPicker());
+  $("model-chip").addEventListener("click", () => void toggleModelPicker());
   $("send-btn").addEventListener("click", sendQuestion);
   $("composer-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(); }

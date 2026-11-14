@@ -18,7 +18,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from agent_platform.auth.provider import AuthContext
+from agent_platform.guardrails.audit import record_event
 from agent_platform.guardrails.middleware import input_guard, output_guard
+from agent_platform.model_gateway.resilience import stream_chat_with_fallback
 
 # 无依据兜底话术（验收硬指标：不编造）
 NO_EVIDENCE_ANSWER = "知识库中未找到与您问题相关的依据，暂时无法回答。请联系管理员确认相关文档是否已入库。"
@@ -85,7 +87,11 @@ def build_chat_graph(*, session_factory, retrieval, gateway, checkpointer):
         return {"citations": citations}
 
     async def generate(state: ChatState, config) -> dict:
-        """生成节点：纯产出完整回答；流式推帧由 output_guard 中间件统一负责。"""
+        """生成节点：纯产出完整回答；流式推帧由 output_guard 中间件统一负责。
+
+        model_chain（统一工作台一期，ADR-016）：经 configurable 注入 [primary, *fallbacks]；
+        未注入时与原行为严格一致（gateway 全局映射，存量链路零感知）。
+        """
 
         # 无依据兜底：不调用模型（验收：0 条引用不编造）
         if not state["citations"]:
@@ -97,8 +103,35 @@ def build_chat_graph(*, session_factory, retrieval, gateway, checkpointer):
             config["configurable"].get("system_prompt") or SYSTEM_WITH_EVIDENCE,
         )
         answer = ""
-        async for delta in gateway.stream_chat(llm_input):
-            answer += delta
+        model_chain = config["configurable"].get("model_chain")
+        if model_chain:
+            # Error Recovery（ADR-016 决策 2）：首帧前失败限次重试 → fallback 链换模；
+            # 换模动作写审计（实际命中模型由网关 usage/latency 上报，此处补换模事件）
+            fallback_auth: AuthContext | None = config["configurable"].get("auth_ctx")
+            profile_key = config["configurable"].get("profile_key")
+
+            async def _audit_fallback(from_model, to_model, error) -> None:
+                if fallback_auth is None:  # 存量链路未带 auth（不应发生），降级不写审计
+                    return
+                async with session_factory() as audit_session:
+                    await record_event(
+                        audit_session,
+                        user_id=fallback_auth.user_id,
+                        username=fallback_auth.username,
+                        action="workbench.model_fallback",
+                        object_type="agent_profile",
+                        object_id=profile_key,
+                        outcome="allowed",
+                        detail={"from_model": from_model, "to_model": to_model, "error": error},
+                    )
+
+            async for delta in stream_chat_with_fallback(
+                gateway, llm_input, model_chain, on_fallback=_audit_fallback
+            ):
+                answer += delta
+        else:
+            async for delta in gateway.stream_chat(llm_input):
+                answer += delta
         return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
     builder = StateGraph(ChatState)

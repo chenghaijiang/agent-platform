@@ -173,6 +173,9 @@ class ChatSession(Base):
     title: Mapped[str | None] = mapped_column(String(128))
     # LangGraph thread 映射：同一 thread_id 的 checkpoint 状态即该会话的执行态
     thread_id: Mapped[uuid.UUID] = mapped_column(Uuid(), unique=True, default=uuid.uuid4)
+    # 会话级绑定智能体（ADR-014 决策 3）：软引用 agent_profiles.key；
+    # null = knowledge-assistant（存量会话零迁移，换智能体 = 开新会话）
+    profile_key: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -198,6 +201,75 @@ class ChatRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+# ---------------- 统一智能工作台（ADR-014~017）----------------
+
+# 引擎枚举（ADR-016 决策 1）：qa_graph 现有 RAG 图 | agentdesk_bridge 桥接 AgentDesk 图（一期过渡）
+# | runtime 二期自研内核（预留位，吸收前两者）
+AGENT_PROFILE_ENGINE_KINDS = ("qa_graph", "agentdesk_bridge", "runtime")
+
+# 消息信封类型（ADR-014 决策 4）：text 普通文本 | agent_event 执行事件流（工具调用/输出/状态）
+# | approval_card 审批卡片（计划确认/工具审批，按钮决策即 resume）
+CHAT_MESSAGE_TYPES = ("text", "agent_event", "approval_card")
+
+
+class AgentProfile(Base):
+    """智能体预设（ADR-014 决策 1 / ADR-016 决策 1）：用户可选的 Agent 应用落地实体。
+
+    prompt 不内嵌（prompt_key 软引用 prompts 发布体系，ADR-010）；
+    tool_whitelist / model_policy 为 JSON 字符串（null = 全部工具 / 回落全局模型映射）。
+    """
+
+    __tablename__ = "agent_profiles"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(64), unique=True)
+    display_name: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str | None] = mapped_column(String(256))
+    # 软引用 prompt_versions.template_key；无发布版本时引擎用代码内默认兜底（与 QA 现状一致）
+    prompt_key: Mapped[str | None] = mapped_column(String(64))
+    # JSON 数组字符串，如 ["read_files","run_command"]；null = 该引擎注册的全部工具
+    tool_whitelist: Mapped[str | None] = mapped_column(Text())
+    engine_kind: Mapped[str] = mapped_column(String(32), default="qa_graph", server_default="qa_graph")
+    # 缺省执行模式（AGENT_TASK_MODES 四档）；QA 类智能体无工具执行，null
+    default_mode: Mapped[str | None] = mapped_column(String(16))
+    # JSON：{primary, fallbacks: []}；null 回落全局 MODEL_CHAT_MODEL（ADR-016 决策 2）
+    model_policy: Mapped[str | None] = mapped_column(Text())
+    enabled: Mapped[bool] = mapped_column(Boolean(), default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+
+class ChatMessage(Base):
+    """会话级消息流水（ADR-015 决策 5）：统一工作台聊天流的消息信封落库。
+
+    `{seq, type, data, task_id}` —— (session_id, seq) 唯一即 SSE Last-Event-ID 续传游标；
+    卡片消息（审批/执行事件）可查询、可回放，重启后聊天流从本表重建；
+    checkpointer 继续只管 QA 图执行态（消息与执行态分库分责，ADR-008）。
+    """
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (UniqueConstraint("session_id", "seq", name="uq_chat_messages_session_seq"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer())
+    type: Mapped[str] = mapped_column(String(32))  # CHAT_MESSAGE_TYPES
+    data: Mapped[str | None] = mapped_column(Text())  # JSON 对象字符串
+    # 归属 Agent 任务（会话 1↔N Task，ADR-015 决策 4）；任务删除置空，消息流水留档
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 # 审计动作集（T08，ADR-007；T12/T13 起 AgentDesk 域新增）：提问 / 越权拦截 / 输入脱敏 / 输出脱敏
 # AgentDesk 域动作带域标签（ADR-011：两域同表，payload 带 domain: agentdesk + task_id）
 AUDIT_ACTIONS = (
@@ -210,6 +282,7 @@ AUDIT_ACTIONS = (
     "agentdesk.out_of_bounds",
     "agentdesk.redline_blocked",
     "agentdesk.approval_decided",  # T13：审批三选决策（once/always/deny）
+    "workbench.model_fallback",  # 统一工作台一期：fallback 链换模（ADR-016，实际命中模型看网关 usage）
 )
 # 审计处置结果：允许（正常放行）/ 过滤（脱敏后放行）/ 拦截（拒绝）
 AUDIT_OUTCOMES = ("allowed", "filtered", "blocked")
@@ -329,6 +402,11 @@ class AgentTask(Base):
     # 工作区隔离目录（ADR-013）：相对工作区根的路径（<task_id> 段，即 workspaces/<task_id>/）
     workspace_dir: Mapped[str] = mapped_column(String(512))
     created_by: Mapped[str] = mapped_column(String(64))  # JWT sub
+    # 统一工作台归属（ADR-015 决策 4）：会话 1↔N Task；仅归属外键，Agent 域/渠道层分治不变；
+    # 会话删除置空，任务留档。索引见迁移 0010
+    chat_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="SET NULL")
+    )
     # T14 队列字段（ADR-005 模式复用）：Worker SKIP LOCKED 认领 + 崩溃重试计数
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer(), default=0, server_default="0")

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>知源 · 企业知识问答工作台</title>
+<title>知源 · 统一智能工作台</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700;900&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
 <section id="view-login" class="view active">
   <div class="login-card">
     <div class="login-brand">知源<span class="seal-dot"></span></div>
-    <div class="login-sub">企业知识问答工作台 · 内部系统</div>
+    <div class="login-sub">统一智能工作台 · 内部系统</div>
     <div class="field">
       <label for="lg-user">账号</label>
       <input id="lg-user" type="text" placeholder="用户名" autocomplete="username">
@@ -39,11 +39,11 @@
   <header class="topbar">
     <div class="topbar-brand">知源<span class="seal-dot"></span></div>
     <nav class="topbar-nav" id="topbar-nav">
-      <button data-route="chat" class="on">知识问答</button>
+      <button data-route="chat" class="on">智能工作台</button>
       <button data-route="kb" id="nav-kb">知识库</button>
       <button data-route="users" id="nav-users">用户与权限</button>
-      <!-- Agent 工作台（T15）：独立功能域，新窗口打开；不入 hash 路由避免 app.js 误处理 -->
-      <a class="agentdesk-entry" href="/agentdesk.html" target="_blank" rel="noopener">Agent 工作台</a>
+      <!-- Agent 能力已内嵌智能工作台（agent picker 选「代码工程师」即 harness 运行时）；
+           独立完整版页面保留可直连：/harness/index.html -->
     </nav>
     <div class="topbar-user">
       <span class="role-chip" id="user-role-chip"></span>
@@ -62,17 +62,22 @@
       </div>
       <div class="conv-list" id="conv-list"></div>
       <div class="rail-foot">
-        <b>当前应用</b>：企业知识问答助手<br>
-        <b>链路</b>：检索 ACL 过滤 · Guardrails 治理 · 引用可溯
+        <b>统一工作台</b>：聊天框即入口<br>
+        <b>引擎</b>：智能问答 · 代码工程（agent picker 切换）
       </div>
     </aside>
 
     <main class="chat-main">
+      <div class="agent-bar">
+        <button class="hw-chip" id="agent-chip" title="选择智能体（切换 = 开新会话；不选即智能问答）">💬 智能问答</button>
+        <button class="hw-chip" id="model-chip" title="切换模型">模型：—</button>
+        <span class="stream-state" id="stream-state">SSE 未连接</span>
+      </div>
       <div class="chat-scroll" id="chat-scroll">
         <div class="chat-inner" id="chat-inner">
           <div class="chat-empty" id="chat-empty">
             <div class="t">向知识助手提问</div>
-            <div class="s">回答基于你有权访问的知识库生成，每条结论均可追溯引用来源</div>
+            <div class="s">回答基于你有权访问的知识库生成；右上角可选智能体（代码工程模式）与模型</div>
           </div>
         </div>
       </div>
@@ -81,22 +86,9 @@
           <textarea id="composer-input" placeholder="向知识助手提问…（Enter 发送）" aria-label="提问输入框"></textarea>
           <button class="send-btn" id="send-btn">发 送</button>
         </div>
-        <div class="composer-tip">回答基于你有权访问的知识库生成 · 每条结论均标注引用来源</div>
+        <div class="composer-tip">智能问答基于知识库生成 · 代码任务在本聊天流内完成计划确认、工具调用与审批</div>
       </div>
     </main>
-
-    <aside class="cite-panel" aria-label="引用来源面板">
-      <div class="cite-head">
-        <div class="h">引用来源</div>
-        <div class="s" id="cite-meta">暂无检索</div>
-      </div>
-      <div class="cite-list" id="cite-list">
-        <div class="cite-empty">左侧选择会话并发起提问<br>引用来源将在此逐条展示</div>
-      </div>
-      <div class="cite-foot">
-        <b>权限说明</b>：仅展示当前账号可见的知识库内容，越权访问已由检索层过滤并写入审计。
-      </div>
-    </aside>
   </div>
 
   <!-- ============ 知识库 ============ -->
@@ -225,6 +217,11 @@
 
 <input type="file" id="file-input" hidden>
 <div id="toast-wrap"></div>
+<!-- Agent 消息 markdown 渲染：复用 harness 客户端的零依赖渲染器（全量 HTML 转义，安全） -->
+<script type="module">
+  import { renderMarkdown } from "./harness/markdown.js";
+  window.renderMarkdown = renderMarkdown;
+</script>
 <script src="app.js"></script>
 </body>
 </html>
