@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "types": ["node"],
+    "paths": { "@harness/contracts": ["../contracts/dist/index.d.ts"] }
+  },
+  "include": ["src"],
+  "references": [{ "path": "../contracts" }]
+}

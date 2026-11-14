@@ -1,0 +1,8 @@
+node_modules/
+dist/
+packages/*/dist/
+**/*.tsbuildinfo
+traces/
+sessions/
+.harness/
+.DS_Store

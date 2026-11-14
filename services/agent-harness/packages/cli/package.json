@@ -1,0 +1,17 @@
+{
+  "name": "@harness/cli",
+  "version": "0.2.0",
+  "description": "Terminal UI client — thin surface over @harness/core (M4)",
+  "type": "module",
+  "bin": { "harness": "dist/main.js" },
+  "scripts": { "build": "tsc -p ." },
+  "dependencies": {
+    "@harness/contracts": "workspace:*",
+    "@harness/core": "workspace:*",
+    "@harness/kb": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}

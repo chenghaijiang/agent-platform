@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from redis.asyncio import Redis
@@ -26,6 +27,7 @@ from agent_platform.chat.api import router as chat_router
 from agent_platform.chat.graph import build_chat_graph
 from agent_platform.core.config import settings
 from agent_platform.db.engine import build_session_factory
+from agent_platform.harness.api import router as harness_router
 from agent_platform.ingest.api import router as ingest_router
 from agent_platform.ingest.storage import DocumentStorage
 from agent_platform.model_gateway.api import router as model_gateway_router
@@ -116,6 +118,12 @@ async def lifespan(app: FastAPI):
     )
     # T10：Prompt 模板基线 seed（表空时从 prompts/ 目录导入 v1 并发布，幂等）
     await _seed_prompt_baseline(app.state.session_factory)
+    # ADR-019：harness 网关上游客户端（连接池复用；SSE 读超时置 None 防长连接被拉断，
+    # 上游不可达时由网关统一 502，不阻塞平台启动——工作台连接状态条如实降级）
+    app.state.harness_client = httpx.AsyncClient(
+        base_url=settings.harness_base_url,
+        timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=30.0),
+    )
     yield
     # 观测数据落盘后再退出，避免丢失尚未批量上报的 trace
     try:
@@ -124,6 +132,7 @@ async def lifespan(app: FastAPI):
         pass
     await redis_client.aclose()
     await checkpoint_pool.close()
+    await app.state.harness_client.aclose()
     await engine.dispose()
 
 
@@ -139,7 +148,9 @@ app.include_router(admin_kbs.router)
 app.include_router(ingest_router)
 app.include_router(retrieval_router)
 app.include_router(chat_router)
-app.include_router(agentdesk_router)
+app.include_router(workbench_router)
+# ADR-019：harness 网关（catch-all /api/harness/{path}，需登录）——必须在静态挂载之前
+app.include_router(harness_router)
 app.include_router(model_gateway_router)
 
 

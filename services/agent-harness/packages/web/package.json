@@ -1,0 +1,10 @@
+{
+  "name": "@harness/web",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Native web client (no framework, no build): index.html / styles.css / app.js over the protocol server",
+  "files": [
+    "public",
+    "src"
+  ]
+}

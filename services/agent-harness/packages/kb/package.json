@@ -1,0 +1,21 @@
+{
+  "name": "@harness/kb",
+  "version": "0.1.0",
+  "description": "M6 knowledge base: local document ingest + hybrid retrieval (Qdrant vectors + SQLite FTS5 + Ollama embeddings)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "scripts": { "build": "tsc -p ." },
+  "dependencies": {
+    "@harness/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  },
+  "//engines": "node:sqlite (DatabaseSync) ships built-in since Node 22.5 — no native dep. On Node 22.x < 22.13 it still needs `node --experimental-sqlite`; >= 22.13 loads it without the flag (an ExperimentalWarning is printed once).",
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

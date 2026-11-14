@@ -154,6 +154,37 @@ services:
       retries: 12
       start_period: 3s
 
+  # ---------------- Agent 工作台（ADR-019：agent-harness Node sidecar） ----------------
+
+  # harness 协议服务器（自研 Agent 内核：TurnMachine + 工具波次调度 + 审批 + Compact + KB）；
+  # 平台形态下不直接暴露宿主机端口——FastAPI 网关（/api/harness/*，require_auth）反向代理；
+  # 模型出口由 entrypoint 生成的 config.yaml 指向平台 model_gateway 上游（与 app 同一组 env）
+  harness:
+    build: ./services/agent-harness
+    image: agent-platform/harness:${APP_VERSION:-0.1.0}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4173
+      MODEL_GATEWAY_BASE_URL: ${MODEL_GATEWAY_BASE_URL:-http://fake-openai:8000/v1}
+      MODEL_GATEWAY_API_KEY: ${MODEL_GATEWAY_API_KEY:-demo-key-not-for-prod}
+      MODEL_CHAT_MODEL: ${MODEL_CHAT_MODEL:-demo-chat-1}
+      # 可选覆盖：上下文窗口/最大输出/迭代上限/Qdrant 地址（默认 FTS-only 降级）
+      # HARNESS_CONTEXT_WINDOW: 131072
+      # HARNESS_MAX_OUTPUT_TOKENS: 8192
+      # HARNESS_MAX_ITERATIONS: 25
+      # HARNESS_QDRANT_URL: http://qdrant:6333
+    volumes:
+      - agent_platform_harness_data:/root/.harness
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4173/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   # T03：OpenAI-compatible 演示服务（仅标准库）：免真实 API key 即可演示网关与观测链路；
   # 切真实模型只需改 .env 的 MODEL_GATEWAY_BASE_URL / API_KEY / 模型名，本服务可停用
   fake-openai:
@@ -334,6 +365,9 @@ volumes:
   agent_platform_workspaces_data:
     driver: local
   minio_data:
+    driver: local
+  # ADR-019：harness 运行时状态（config.yaml/sessions/knowledge/qdrant），随 compose 生命周期管理
+  agent_platform_harness_data:
     driver: local
   langfuse_postgres_data:
     driver: local

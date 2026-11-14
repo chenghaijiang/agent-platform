@@ -20,3 +20,11 @@ evals/results/last.json
 
 # AgentDesk 工作区本地运行产物（容器内为命名卷；本地裸跑时 config 默认相对路径 ./workspaces）
 workspaces/
+
+# agent-harness sidecar（ADR-019）：TS 构建产物与运行时状态不入库
+services/agent-harness/node_modules/
+services/agent-harness/packages/*/dist/
+services/agent-harness/*.tsbuildinfo
+services/agent-harness/packages/*/*.tsbuildinfo
+services/agent-harness/traces/
+services/agent-harness/.harness/

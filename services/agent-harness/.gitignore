@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+sessions/
+traces/
+.env
+# runtime state (memory logs, task board, message inbox, knowledge index)
+# ignore everything under .harness/ except skills/ (project-shared, team can reuse after clone)
+.harness/*
+!.harness/skills/
+kb.db
+*.db-journal
+*.db-wal
+*-worktrees/

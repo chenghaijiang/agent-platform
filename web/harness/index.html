@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知源 · Agent 工作台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+
+<!-- ======= Top Bar ======= -->
+<header class="topbar">
+  <div class="logo"><div class="logo-mark">⌘</div>知源 · Agent 工作台</div>
+  <span class="env-badge" id="env-badge">● Runtime</span>
+  <div class="topbar-right">
+    <button class="conn" id="conn" type="button" title="SSE 连接状态（点击手动重连）">
+      <i class="conn-dot" id="conn-dot"></i><span id="conn-text">连接中</span>
+    </button>
+    <span class="model-chip" id="model-chip">—</span>
+    <button class="mode-toggle" id="mode-toggle" type="button" title="智能体：模型可调用工具（命令、知识库、子代理）完成目标；智能问答：纯对话，不执行工具">🤖 智能体</button>
+    <div class="avatar" id="harness-avatar" title="平台账号"></div>
+  </div>
+</header>
+
+<div class="app">
+
+  <!-- ======= Sidebar ======= -->
+  <aside class="sidebar">
+    <button class="new-task-btn" id="new-task" type="button">＋ 新建任务</button>
+
+    <div class="sidebar-section">会话</div>
+    <div class="session-list" id="session-list"></div>
+
+    <div class="sidebar-section">扩展</div>
+    <div class="side-links">
+      <button class="side-link" type="button" id="files-btn">
+        📁 工作区<span class="soon" hidden></span>
+      </button>
+      <button class="side-link" type="button" id="kb-btn">
+        📚 知识库<span class="soon" id="kb-count" hidden>0</span>
+      </button>
+      <button class="side-link" type="button" id="skills-btn">
+        🧩 技能<span class="soon" id="skills-count" hidden>0</span>
+      </button>
+      <button class="side-link" type="button" id="data-btn">
+        🗄️ 数据<span class="soon" hidden></span>
+      </button>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="footer-chip" data-placeholder="Skills">📚 Skills</div>
+      <div class="footer-chip" data-placeholder="MCP">🔌 MCP</div>
+      <div class="footer-chip" data-placeholder="Config">⚙️ Config</div>
+    </div>
+  </aside>
+
+  <!-- ======= Main Chat ======= -->
+  <main class="main">
+    <div class="main-header">
+      <h2 id="session-title">新任务</h2>
+      <div class="turn-phase" id="phase-chip"><i class="phase-dot"></i><span id="phase-text">IDLE</span></div>
+      <span class="trace-mini" id="trace-mini">trace: —</span>
+    </div>
+
+    <div class="chat" id="chat"></div>
+
+    <div class="input-bar">
+      <div class="input-wrap">
+        <textarea id="composer" rows="1" placeholder="输入消息…（Enter 发送 / Shift+Enter 换行）"></textarea>
+        <button class="send-btn" id="send-btn" type="button" title="发送">↑</button>
+      </div>
+      <div class="input-actions">
+        <span class="input-hint" id="input-hint">Enter 发送 · Shift+Enter 换行</span>
+      </div>
+    </div>
+  </main>
+
+  <!-- ======= Right Panel ======= -->
+  <aside class="right-panel">
+
+    <section class="panel-section">
+      <div class="panel-title">📊 上下文窗口</div>
+      <div class="ctx-bar">
+        <div class="ctx-row"><span>已用 / 上限</span><b id="ctx-used">0 / 32K（0%）</b></div>
+        <div class="ctx-track">
+          <div class="ctx-seg sys" id="seg-system"></div>
+          <div class="ctx-seg mem" id="seg-memory"></div>
+          <div class="ctx-seg hist" id="seg-history"></div>
+          <div class="ctx-seg obs" id="seg-observations"></div>
+        </div>
+        <div class="ctx-legend">
+          <div class="legend-item"><i class="legend-dot sys"></i>系统提示 <b id="leg-system">0</b></div>
+          <div class="legend-item"><i class="legend-dot mem"></i>记忆注入 <b id="leg-memory">0</b></div>
+          <div class="legend-item"><i class="legend-dot hist"></i>会话历史 <b id="leg-history">0</b></div>
+          <div class="legend-item"><i class="legend-dot obs"></i>工具观察 <b id="leg-observations">0</b></div>
+        </div>
+        <div class="compact-note" id="compact-note" hidden></div>
+      </div>
+    </section>
+
+    <section class="panel-section">
+      <div class="panel-title">🔄 Turn 状态机</div>
+      <div class="phase-list" id="phase-list"></div>
+    </section>
+
+    <section class="panel-section">
+      <div class="panel-title">🔐 待审批</div>
+      <div id="approvals"></div>
+      <div class="empty-note" id="approvals-empty">没有待审批请求</div>
+    </section>
+
+    <section class="panel-section">
+      <div class="panel-title">🤖 子代理（Task）</div>
+      <div id="subagents"></div>
+      <div class="empty-note" id="subagents-empty">本会话尚未派生子代理</div>
+    </section>
+
+    <section class="panel-section">
+      <div class="panel-title">📈 本次任务统计</div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="stat-val" id="stat-turns">0</div><div class="stat-label">Turn</div></div>
+        <div class="stat-box"><div class="stat-val" id="stat-tools">0</div><div class="stat-label">工具调用</div></div>
+        <div class="stat-box"><div class="stat-val" id="stat-waves">0</div><div class="stat-label">并行 Wave</div></div>
+      </div>
+      <div class="trace-block">
+        <span>trace</span><b id="trace-id">—</b>
+      </div>
+      <div class="trace-block">
+        <span>runtime</span><b id="agent-id">—</b>
+      </div>
+      <div class="trace-block">
+        <span>qdrant</span><b id="qdrant-state">—</b>
+      </div>
+    </section>
+
+  </aside>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<!-- 经平台认证网关访问：所有 /api/* 请求由 app.js 统一加 /api/harness 前缀并携带 Bearer token；
+     未登录访问会被网关 401 拒绝并跳转平台登录页（app.js 要求登录态） -->
+<script type="module" src="./app.js"></script>
+</body>
+</html>

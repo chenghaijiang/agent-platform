@@ -1,0 +1,25 @@
+{
+  "name": "agent-harness",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Personal Agent Harness — M0 skeleton (see agent-harness-design.md)",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -b",
+    "architecture:check": "node scripts/architecture/check.mjs",
+    "check": "pnpm build && pnpm architecture:check",
+    "clean": "tsc -b --clean",
+    "harness": "node packages/cli/dist/main.js",
+    "start": "node packages/cli/dist/main.js",
+    "auto": "node packages/cli/dist/main.js auto",
+    "kb": "node packages/cli/dist/main.js kb",
+    "serve": "node packages/server/dist/main.js",
+    "qdrant": "QDRANT__STORAGE__STORAGE_PATH=\"$HOME/.harness/qdrant/storage\" \"$HOME/.harness/bin/qdrant\"",
+    "service": "node scripts/service/install.mjs",
+    "ctl": "bash scripts/ctl.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}

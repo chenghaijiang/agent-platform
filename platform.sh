@@ -63,6 +63,7 @@ case "${1:-status}" in
     printf "healthz: %s\n" "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1:8000/healthz || echo unreachable)"
     printf "readyz : %s\n" "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1:8000/readyz || echo unreachable)"
     printf "web    : %s\n" "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1:8000/ || echo unreachable)"
+    printf "harness : %s\n" "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1:8000/api/harness/api/health || echo unreachable)  # 经网关（401=网关在但未带登录态；000=sidecar 未起）"
     printf "langfuse: %s\n" "$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://127.0.0.1:3000/api/public/health || echo unreachable)"
     echo "=== 当前模型映射（key 打码） ==="
     grep -E "^MODEL_(GATEWAY_BASE_URL|CHAT_MODEL|EMBEDDING_MODEL)=" .env || echo "（.env 无 MODEL_* 配置，用 compose 默认 fake-openai）"

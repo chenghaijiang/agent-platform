@@ -68,5 +68,10 @@ class Settings(BaseSettings):
     agentdesk_poll_interval_seconds: float = 2.0
     agentdesk_max_attempts: int = 3
 
+    # ---------------- agent-harness 工作台（ADR-019）----------------
+    # Node sidecar 协议服务器地址：compose 内网 http://harness:4173，本地裸跑默认 127.0.0.1:4173；
+    # 上游无认证，可访问性由 harness/api.py 网关的 require_auth 收口
+    harness_base_url: str = "http://127.0.0.1:4173"
+
 
 settings = Settings()
