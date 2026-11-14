@@ -5,6 +5,12 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
+# T11（ADR-013）：工作区底座依赖 git（演示仓基线提交与 T13 workspace 分支提交）；
+# checks（pytest/ruff）随主依赖安装（见 pyproject），镜像内零额外依赖可运行
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # 依赖层：仅凭 lock 文件安装，代码变更不触发依赖重装

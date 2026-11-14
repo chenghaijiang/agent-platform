@@ -8,3 +8,5 @@ __pycache__
 .ruff_cache
 README.md
 docker-compose.override.yml
+# T11：本地裸跑产生的 Task 工作区不进镜像（容器内为命名卷挂载点 /app/workspaces）
+workspaces

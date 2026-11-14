@@ -21,6 +21,10 @@ dependencies = [
     "langgraph>=1.2.20",
     "langgraph-checkpoint-postgres>=3.2.0",
     "pyyaml>=6.0.3",
+    # AgentDesk checks 运行时依赖（T11，ADR-013）：演示仓 pytest/ruff 须在容器内零额外依赖可运行，
+    # 故为平台主依赖而非 dev 组（镜像 uv sync --no-dev 也安装）
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
 ]
 
 [dependency-groups]
@@ -35,6 +39,12 @@ dev = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
+# 仅收集 tests/：src/ 下随包发布的 AgentDesk 演示仓（test_pricing.py 预置失败缺陷）不进平台套件
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# B008：FastAPI Depends(...) 参数默认值是框架官方惯例，全部路由文件统一豁免
+ignore = ["B008"]
 
 [build-system]
 requires = ["hatchling"]

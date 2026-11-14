@@ -53,5 +53,20 @@ class Settings(BaseSettings):
     ingest_poll_interval_seconds: float = 2.0
     ingest_health_port: int = 9101  # worker TCP 健康探针（compose healthcheck）
 
+    # ---------------- AgentDesk（T11，ADR-011/013）----------------
+    # Agent 执行域工作区根：容器内为 compose 卷挂载点 /app/workspaces（Task 级隔离目录 <task_id>/）
+    agentdesk_workspaces_dir: str = "workspaces"
+    # 工具层（T12，ADR-013）：subprocess 超时与输出截断（L4 留痕同受此限）
+    agentdesk_tool_timeout_seconds: int = 30
+    agentdesk_tool_output_max_chars: int = 8000
+    # 执行图预算硬上限（T13，ADR-013）：工具循环步数 / 累计 token / 修复回灌轮次，超限如实降级 partial
+    agentdesk_max_steps: int = 12
+    agentdesk_max_total_tokens: int = 120000
+    agentdesk_max_check_rounds: int = 2
+    # 任务队列（T14，ADR-005 模式复用）：Worker 认领租约 / 轮询间隔 / 重试上限（超出降级 partial）
+    agentdesk_lease_seconds: int = 300
+    agentdesk_poll_interval_seconds: float = 2.0
+    agentdesk_max_attempts: int = 3
+
 
 settings = Settings()

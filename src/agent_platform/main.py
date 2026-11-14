@@ -14,6 +14,12 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from agent_platform.agentdesk.api import router as agentdesk_router
+from agent_platform.agentdesk.graph import build_agent_graph
+from agent_platform.agentdesk.llm import GatewayInvoker
+from agent_platform.agentdesk.runner import AgentDeskRunner
+from agent_platform.agentdesk.tools import ToolExecutor
+from agent_platform.agentdesk.workspace import WorkspaceManager
 from agent_platform.api import admin_audit, admin_kbs, admin_users, me
 from agent_platform.auth.router import router as auth_router
 from agent_platform.chat.api import router as chat_router
@@ -67,7 +73,7 @@ async def lifespan(app: FastAPI):
     app.state.document_storage = DocumentStorage.from_settings()
     try:
         await asyncio.to_thread(app.state.document_storage.ensure_bucket)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - 建桶失败不阻塞启动（Worker 侧重试）
         pass
     # T06 起：在线检索服务（双路召回 + ACL 过滤，复用模型网关向量化 query）
     retrieval_service = RetrievalService(app.state.model_gateway)
@@ -93,13 +99,28 @@ async def lifespan(app: FastAPI):
         gateway=app.state.model_gateway,
         checkpointer=checkpointer,
     )
+    # T13 起：Agent 执行图（thread_id=task_id，同一 Checkpointer 持久化，重启可恢复审批等待态）
+    workspaces = WorkspaceManager(Path(settings.agentdesk_workspaces_dir))
+    app.state.agent_runner = AgentDeskRunner(
+        build_agent_graph(
+            session_factory=app.state.session_factory,
+            workspace_manager=workspaces,
+            executor=ToolExecutor.from_settings(workspaces),
+            invoker=GatewayInvoker(app.state.model_gateway),
+            checkpointer=checkpointer,
+            max_steps=settings.agentdesk_max_steps,
+            max_total_tokens=settings.agentdesk_max_total_tokens,
+            max_check_rounds=settings.agentdesk_max_check_rounds,
+        ),
+        app.state.session_factory,
+    )
     # T10：Prompt 模板基线 seed（表空时从 prompts/ 目录导入 v1 并发布，幂等）
     await _seed_prompt_baseline(app.state.session_factory)
     yield
     # 观测数据落盘后再退出，避免丢失尚未批量上报的 trace
     try:
         await app.state.model_gateway.flush()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - 观测 flush 失败不阻塞退出
         pass
     await redis_client.aclose()
     await checkpoint_pool.close()
@@ -118,6 +139,7 @@ app.include_router(admin_kbs.router)
 app.include_router(ingest_router)
 app.include_router(retrieval_router)
 app.include_router(chat_router)
+app.include_router(agentdesk_router)
 app.include_router(model_gateway_router)
 
 
@@ -141,12 +163,12 @@ async def readyz() -> dict[str, Any]:
         async with app.state.engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
         checks["postgres"] = True
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - 探针语义：失败即 degraded
         pass
 
     try:
         checks["redis"] = bool(await app.state.redis.ping())
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - 探针语义：失败即 degraded
         pass
 
     if all(checks.values()):

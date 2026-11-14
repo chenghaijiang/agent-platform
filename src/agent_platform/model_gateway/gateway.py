@@ -12,12 +12,13 @@
 """
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import openai
-from langfuse import observe, get_client
+from langfuse import get_client, observe
 from langfuse.openai import openai as langfuse_openai
 
 from agent_platform.core.config import settings
@@ -39,6 +40,26 @@ class ChatResult:
     """统一生成结果：文本 + 模型名 + token 用量 + 耗时。"""
 
     text: str
+    model: str
+    usage: dict[str, int]
+    latency_ms: int
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """模型返回的一次工具调用（T13 工具循环用，与具体供应商格式解耦）。"""
+
+    id: str
+    name: str
+    args: dict  # JSON 解析后的参数；解析失败降级为 {}
+
+
+@dataclass(frozen=True)
+class ChatToolsResult:
+    """工具调用轮的生成结果：叙述文本 + 工具调用列表 + 用量。"""
+
+    content: str
+    tool_calls: list[ToolCall]
     model: str
     usage: dict[str, int]
     latency_ms: int
@@ -146,6 +167,57 @@ class ModelGateway:
         except openai.OpenAIError as exc:
             raise self._translate(exc, CAPABILITY_CHAT, model) from exc
 
+    # ---------- 能力位一：生成（工具调用，T13 Agent 工具循环） ----------
+    @observe(name="model_gateway.chat_tools")
+    async def chat_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        model: str | None = None,
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+    ) -> ChatToolsResult:
+        """tool-calling 调用：透传 tools 定义，解析 tool_calls（内容与参数结构化）。
+
+        temperature 取低值：Agent 工具循环需要稳定而非发散。
+        """
+        model = model or settings.model_chat_model
+        if not model:
+            raise ModelConfigError("chat model mapping is empty", capability=CAPABILITY_CHAT, model="")
+        started = time.perf_counter()
+        try:
+            response = await self._client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except openai.OpenAIError as exc:
+            raise self._translate(exc, CAPABILITY_CHAT, model) from exc
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        choice = response.choices[0]
+        usage = response.usage
+        calls: list[ToolCall] = []
+        for call in choice.message.tool_calls or []:
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:  # 供应商畸形参数：降级为空参，由策略层参数校验拦截
+                args = {}
+            calls.append(ToolCall(id=call.id, name=call.function.name, args=args))
+        return ChatToolsResult(
+            content=choice.message.content or "",
+            tool_calls=calls,
+            model=response.model or model,
+            usage={
+                "prompt_tokens": usage.prompt_tokens if usage else 0,
+                "completion_tokens": usage.completion_tokens if usage else 0,
+                "total_tokens": usage.total_tokens if usage else 0,
+            },
+            latency_ms=latency_ms,
+        )
+
     # ---------- 能力位二：Embedding ----------
     @observe(name="model_gateway.embed")
     async def embed(self, texts: list[str], *, model: str | None = None) -> EmbedResult:
@@ -179,7 +251,7 @@ class ModelGateway:
             if client is not None:
                 # flush() 为同步阻塞实现，卸到线程避免阻塞事件循环
                 await asyncio.to_thread(client.flush)
-        except Exception:  # noqa: BLE001 - 观测上报失败不影响业务链路
+        except Exception:  # noqa: BLE001, S110 - 观测上报失败不影响业务链路
             pass
 
     @staticmethod

@@ -1,4 +1,4 @@
-"""ORM 模型（T02/T04/T05/T07）：账号 / 知识库 ACL / 入库任务 / 知识块 / 会话与 Run。
+"""ORM 模型（T02/T04/T05/T07/T11）：账号 / 知识库 ACL / 入库任务 / 知识块 / 会话与 Run / AgentDesk。
 
 知识库是企业知识隔离单元（T04）：管理员创建元数据并对角色授权（角色 × 知识库 = 可读/不可见），
 可见性查询是 T06 检索 ACL 过滤与 T08 审计的数据来源。
@@ -198,8 +198,19 @@ class ChatRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-# 审计动作集（T08，ADR-007）：提问 / 越权拦截 / 输入脱敏 / 输出脱敏（retrieval.search 留扩展）
-AUDIT_ACTIONS = ("chat.ask", "retrieval.search", "retrieval.denied", "guard.input_masked", "guard.output_masked")
+# 审计动作集（T08，ADR-007；T12/T13 起 AgentDesk 域新增）：提问 / 越权拦截 / 输入脱敏 / 输出脱敏
+# AgentDesk 域动作带域标签（ADR-011：两域同表，payload 带 domain: agentdesk + task_id）
+AUDIT_ACTIONS = (
+    "chat.ask",
+    "retrieval.search",
+    "retrieval.denied",
+    "guard.input_masked",
+    "guard.output_masked",
+    "agentdesk.tool_call",
+    "agentdesk.out_of_bounds",
+    "agentdesk.redline_blocked",
+    "agentdesk.approval_decided",  # T13：审批三选决策（once/always/deny）
+)
 # 审计处置结果：允许（正常放行）/ 过滤（脱敏后放行）/ 拦截（拒绝）
 AUDIT_OUTCOMES = ("allowed", "filtered", "blocked")
 
@@ -249,3 +260,178 @@ class PromptVersion(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ---------------- AgentDesk：Agent 执行域（T11，ADR-011/013）----------------
+
+# Agent 任务九态状态机（意图容器生命周期：规划→执行→检查→验收→交付）
+AGENT_TASK_STATUSES = (
+    "created",    # 已创建：工作区已分配、演示仓已装载，待规划
+    "planned",    # 计划已产出：等待用户确认（计划/确认模式）
+    "running",    # 执行中：工具循环
+    "blocked",    # 被阻塞：等待审批 interrupt resume 或用户确认
+    "verifying",  # 检查回灌中：pytest/ruff 校验，失败回灌执行
+    "partial",    # 部分完成：修复轮次/步数/预算超限，如实降级
+    "review",     # 待人工验收：hunk 逐块接受
+    "committed",  # 已提交：门禁通过，workspace 分支落盘
+    "cancelled",  # 已取消
+)
+
+# 四档执行模式（ADR-013 L3 求值输入）：变更前确认 / 自动编辑 / 计划模式 / 完全访问
+AGENT_TASK_MODES = ("confirm", "auto_edit", "plan", "full_access")
+
+# 终态九态的子集（T14 正式化）：runner._fail 兜底、SSE 关流、commit 门禁均以此为据
+AGENT_TASK_TERMINAL_STATUSES = ("partial", "review", "committed", "cancelled")
+
+# 事件类型（agentdesk-implementation.md §3）：信封 {type, seq, ts, data}，证据链实体
+TASK_EVENT_TYPES = (
+    "task_status",
+    "plan",
+    "tool_start",
+    "tool_result",
+    "approval_required",
+    "approval_resolved",
+    "delta",
+    "check_start",
+    "check_result",
+    "verify",
+    "summary",
+    "out_of_bounds",
+    "redline_blocked",
+)
+
+# 审批单状态与三选决策（ADR-013 L3：仅本次 / 总是允许 / 拒绝）
+APPROVAL_STATUSES = ("pending", "resolved")
+APPROVAL_DECISIONS = ("once", "always", "deny")
+
+
+class AgentTask(Base):
+    """Agent 任务（T11，ADR-011）：Agent 执行域的意图容器。
+
+    Task ≠ Job：ADR-008 的「任务=异步业务作业」归知识问答域（ingest_tasks 语义不变），
+    本表承载 goal/owns/mode 的可检索、可归档执行意图，由执行会话推进。
+    """
+
+    __tablename__ = "agent_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    title: Mapped[str | None] = mapped_column(String(128))  # 缺省由 goal 派生（T14 API 派生）
+    goal: Mapped[str] = mapped_column(Text())
+    # owns（ADR-011 边界声明）：可改动路径集合，JSON 数组字符串（如 ["payment-console/**"]），
+    # T12 策略引擎 L1 越界检测与并行互斥的声明源
+    owns: Mapped[str] = mapped_column(Text(), server_default="[]")
+    mode: Mapped[str] = mapped_column(String(16), default="confirm", server_default="confirm")
+    # @ 引用（PRD §2.1）：附件/文件引用的 JSON 数组字符串
+    refs: Mapped[str | None] = mapped_column(Text())
+    status: Mapped[str] = mapped_column(
+        String(16), default="created", server_default="created", index=True
+    )
+    # 工作区隔离目录（ADR-013）：相对工作区根的路径（<task_id> 段，即 workspaces/<task_id>/）
+    workspace_dir: Mapped[str] = mapped_column(String(512))
+    created_by: Mapped[str] = mapped_column(String(64))  # JWT sub
+    # T14 队列字段（ADR-005 模式复用）：Worker SKIP LOCKED 认领 + 崩溃重试计数
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer(), default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+
+# hunk 评审状态（T14，PRD 门禁）：pending → accepted / rejected，全 accepted 才可提交
+HUNK_STATUSES = ("pending", "accepted", "rejected")
+
+
+class AgentHunk(Base):
+    """diff 逐块评审载体（T14，PRD 门禁）：review 态从 workspace git diff 生成，按文件分块。
+
+    门禁语义：commit 前要求全部 hunk accepted 且 checks 全绿；
+    (task_id, idx) 唯一保证幂等生成（已存在则跳过再生成）。
+    """
+
+    __tablename__ = "agent_hunks"
+    __table_args__ = (UniqueConstraint("task_id", "idx", name="uq_agent_hunks_task_idx"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True
+    )
+    idx: Mapped[int] = mapped_column(Integer())
+    path: Mapped[str] = mapped_column(String(512))  # 相对 workspace 根
+    header: Mapped[str | None] = mapped_column(Text())  # diff 头（---/+++/@@ 行）
+    content: Mapped[str | None] = mapped_column(Text())  # diff 块内容（截断落库）
+    additions: Mapped[int | None] = mapped_column(Integer())
+    deletions: Mapped[int | None] = mapped_column(Integer())
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", server_default="pending"
+    )
+    decided_by: Mapped[str | None] = mapped_column(String(64))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class TaskEvent(Base):
+    """任务事件（T11）：证据链实体，一表三用（SSE 直播 / Last-Event-ID 回放 / 审计证据链）。
+
+    seq 按 task 内单调递增（(task_id, seq) 唯一约束兜底），该组合即游标查询键。
+    """
+
+    __tablename__ = "task_events"
+    __table_args__ = (UniqueConstraint("task_id", "seq", name="uq_task_events_task_seq"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="CASCADE")
+    )
+    seq: Mapped[int] = mapped_column(Integer())
+    type: Mapped[str] = mapped_column(String(32))  # TASK_EVENT_TYPES
+    data: Mapped[str | None] = mapped_column(Text())  # JSON 对象字符串
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Approval(Base):
+    """审批单（T11，ADR-013 L3）：L2 命令挂起（interrupt）后的三选决策载体。"""
+
+    __tablename__ = "approvals"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_tasks.id", ondelete="CASCADE"), index=True
+    )
+    command: Mapped[str] = mapped_column(Text())
+    scope: Mapped[str] = mapped_column(String(128))  # 命令作用域（工具名/命令模式）
+    reason: Mapped[str | None] = mapped_column(Text())
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", server_default="pending", index=True
+    )
+    decision: Mapped[str | None] = mapped_column(String(16))  # once / always / deny
+    decided_by: Mapped[str | None] = mapped_column(String(64))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AlwaysAllowed(Base):
+    """「总是允许」策略（T11，ADR-013）：用户 × 工具 × 命令模式的放行授权，带有效期。
+
+    决策 deny→once→always 写入即产生（decision=always 时同步落一行），
+    求值归 T12 策略引擎；授权本身是权限面，须受审计跟踪（ADR-013 风险项）。
+    """
+
+    __tablename__ = "always_allowed"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    tool: Mapped[str] = mapped_column(String(32))
+    pattern: Mapped[str] = mapped_column(String(256))  # 命令前缀/模式
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
