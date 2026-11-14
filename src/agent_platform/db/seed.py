@@ -8,7 +8,7 @@ import asyncio
 import uuid
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_platform.core.config import settings
 from agent_platform.core.security import hash_password

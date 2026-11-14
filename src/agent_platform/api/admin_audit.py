@@ -1,7 +1,6 @@
 """审计事件查询 API（T08）：仅管理员可查，按用户 / 动作 / 时间窗过滤。"""
 
 import json
-import uuid
 from datetime import datetime
 from typing import Any
 

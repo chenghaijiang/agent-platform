@@ -7,4 +7,4 @@ Graph 定义本身不含治理逻辑：build_chat_graph 仅以 input_guard/outpu
 from agent_platform.guardrails.masking import mask_input, screen_output, screen_text
 from agent_platform.guardrails.middleware import input_guard, output_guard
 
-__all__ = ["mask_input", "screen_output", "screen_text", "input_guard", "output_guard"]
+__all__ = ["input_guard", "mask_input", "output_guard", "screen_output", "screen_text"]

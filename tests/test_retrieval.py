@@ -25,11 +25,11 @@ from agent_platform.db.models import (
     KnowledgeBaseAcl,
     Role,
 )
+from agent_platform.model_gateway.gateway import EmbedResult
 from agent_platform.retrieval.service import (
     RetrievalPermissionError,
     RetrievalService,
 )
-from agent_platform.model_gateway.gateway import EmbedResult
 
 ADMIN = AuthContext(user_id="u1", username="admin", role="admin", provider="test")
 MEMBER = AuthContext(user_id="u2", username="member", role="member", provider="test")
@@ -246,7 +246,7 @@ async def test_api_search_returns_citations(env):
 
 
 async def test_api_search_forbidden_kb_403_with_denied_ids(env):
-    ac, _factory, service, app = env
+    ac, _factory, _service, app = env
     app.dependency_overrides[require_auth] = lambda: MEMBER
     resp = await ac.post("/api/search", json={"query": "保密", "kb_ids": [str(KB_B)]})
     assert resp.status_code == 403

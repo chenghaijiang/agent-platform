@@ -1,6 +1,5 @@
 """Prompt 版本管理单测（T10）：版本号单调 / 发布封版 / 当前版本唯一 / 链路读发布版。"""
 
-import json
 
 import pytest
 import pytest_asyncio

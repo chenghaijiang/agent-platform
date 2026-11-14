@@ -8,7 +8,7 @@
 """
 
 import asyncio
-from typing import Callable
+from collections.abc import Callable
 
 from langchain_core.messages import AIMessage, HumanMessage
 

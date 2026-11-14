@@ -23,7 +23,11 @@ from agent_platform.auth.provider import AuthContext
 from agent_platform.chat.graph import build_chat_graph
 from agent_platform.db.models import AuditEvent, Base
 from agent_platform.guardrails.masking import screen_text
-from agent_platform.retrieval.service import RetrievalPermissionError, RetrievalResult, RetrievedChunk
+from agent_platform.retrieval.service import (
+    RetrievalPermissionError,
+    RetrievalResult,
+    RetrievedChunk,
+)
 
 ADMIN = AuthContext(user_id="u-admin", username="admin", role="admin", provider="test")
 MEMBER = AuthContext(user_id="u-member", username="member", role="member", provider="test")

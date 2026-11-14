@@ -15,7 +15,11 @@ from agent_platform.model_gateway.errors import (
     ModelRateLimitError,
     ModelUnavailableError,
 )
-from agent_platform.model_gateway.gateway import CAPABILITY_CHAT, ModelGateway, resolve_model_for
+from agent_platform.model_gateway.gateway import (
+    CAPABILITY_CHAT,
+    ModelGateway,
+    resolve_model_for,
+)
 
 
 def _gateway() -> ModelGateway:

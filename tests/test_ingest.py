@@ -208,7 +208,7 @@ async def test_upload_returns_queued_task_immediately(env):
 
 
 async def test_upload_same_content_is_idempotent(env):
-    ac, factory, _storage, _gateway, kb_id = env
+    ac, _factory, _storage, _gateway, kb_id = env
     payload = ("report.md", "# 报告\n同一份内容".encode(), "text/markdown")
     first = await ac.post(f"/api/admin/kbs/{kb_id}/documents", files={"file": payload})
     second = await ac.post(f"/api/admin/kbs/{kb_id}/documents", files={"file": payload})

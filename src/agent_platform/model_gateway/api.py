@@ -4,13 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agent_platform.auth.deps import require_admin
+from agent_platform.model_gateway.errors import ModelGatewayError
 from agent_platform.model_gateway.gateway import (
     CAPABILITY_CHAT,
     CAPABILITY_EMBEDDING,
     ModelGateway,
     resolve_model_for,
 )
-from agent_platform.model_gateway.errors import ModelGatewayError
 
 router = APIRouter(prefix="/api/admin/model-gateway", tags=["model-gateway"])
 

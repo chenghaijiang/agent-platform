@@ -11,12 +11,18 @@ import uuid
 from dataclasses import dataclass
 
 from langfuse import observe
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import DataError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_platform.auth.provider import AuthContext
-from agent_platform.db.models import IngestTask, KbChunk, KnowledgeBase, KnowledgeBaseAcl, Role
+from agent_platform.db.models import (
+    IngestTask,
+    KbChunk,
+    KnowledgeBase,
+    KnowledgeBaseAcl,
+    Role,
+)
 
 logger = logging.getLogger("agent_platform.retrieval")
 

@@ -5,7 +5,6 @@ Postgres Checkpointer 的容器重启恢复由端到端验证（验收硬指标�
 """
 
 import json
-import uuid
 
 import pytest_asyncio
 from fastapi import FastAPI
@@ -246,7 +245,7 @@ async def test_chat_sse_streams_and_done_frame_carries_citations(env):
 
 
 async def test_run_record_completed_with_citations(env):
-    ac, factory, _gateway, _graph = env
+    ac, _factory, _gateway, _graph = env
     session_id = (await ac.post("/api/sessions", json={"title": "记录"})).json()["id"]
     await ac.post(f"/api/sessions/{session_id}/chat", json={"question": "报销截止日？"})
     runs = (await ac.get(f"/api/sessions/{session_id}/runs")).json()

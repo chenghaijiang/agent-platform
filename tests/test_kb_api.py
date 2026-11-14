@@ -1,6 +1,5 @@
 """知识库元数据与 ACL API 单测（T04）：CRUD / 授权收回 / 可见性一致性 / 级联删除。"""
 
-import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient

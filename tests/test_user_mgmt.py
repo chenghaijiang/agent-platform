@@ -6,7 +6,6 @@ chunks 覆盖：切片列表有序返回（含向量维度）/ task 不属于该
 
 import uuid
 
-import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -19,7 +18,14 @@ from agent_platform.api.deps import get_session
 from agent_platform.auth.deps import require_admin
 from agent_platform.auth.provider import AuthContext
 from agent_platform.core.security import verify_password
-from agent_platform.db.models import Base, IngestTask, KbChunk, KnowledgeBase, Role, User
+from agent_platform.db.models import (
+    Base,
+    IngestTask,
+    KbChunk,
+    KnowledgeBase,
+    Role,
+    User,
+)
 
 ADMIN_UID = str(uuid.uuid4())
 ADMIN = AuthContext(user_id=ADMIN_UID, username="tester", role="admin", provider="test")

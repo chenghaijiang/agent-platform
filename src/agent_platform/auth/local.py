@@ -1,7 +1,7 @@
 """本地口令认证实现（T02，ADR-006 默认实现）：查 users 表校验口令哈希，自签 JWT。"""
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_platform.auth.provider import AuthContext, AuthResult, TokenPair
 from agent_platform.auth.tokens import decode_access_token, issue_access_token

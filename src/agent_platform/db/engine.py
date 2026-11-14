@@ -1,6 +1,6 @@
 """异步数据库访问装配（T02 起）：engine 归应用 lifespan 持有，本模块提供工厂构建。"""
 
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
