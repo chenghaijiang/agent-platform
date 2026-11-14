@@ -99,12 +99,28 @@ async def chat(
                     },
                 )
             )
-            # 消费生成节点推入的增量文本 → SSE delta 帧
-            while True:
-                delta = await token_queue.get()
-                if delta is None:
-                    break
-                yield _sse("delta", {"text": delta})
+            # 消费生成节点推入的增量文本 → SSE delta 帧；
+            # 哨兵 None 由 output_guard 在生成成功后推送，因此图中途异常时不会到来——
+            # 必须同时监视 graph_task（否则 get() 永久挂起，SSE 流挂死到客户端超时），
+            # 图异常时在下方 await graph_task 处抛出，由 except 统一转 error 帧关流。
+            get_task = asyncio.create_task(token_queue.get())
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {get_task, graph_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if get_task in done:
+                        delta = get_task.result()
+                        if delta is None:
+                            break
+                        yield _sse("delta", {"text": delta})
+                        get_task = asyncio.create_task(token_queue.get())
+                    elif graph_task in done:
+                        await graph_task  # 异常在此抛出；正常结束必先收到哨兵，不可达
+                        break
+            finally:
+                if not get_task.done():
+                    get_task.cancel()
 
             final = await graph_task
             citations = final.get("citations", [])
