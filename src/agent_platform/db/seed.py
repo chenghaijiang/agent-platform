@@ -24,7 +24,7 @@ _BASE_ROLES: tuple[tuple[str, str], ...] = (
 
 # 内置智能体（ADR-016 决策 1）：一期 seed 两个，均不内嵌 prompt 模板——
 # knowledge-assistant 软引用现有 chat_qa 发布体系（零迁移）；
-# code-engineer 一期用 agentdesk 图内置 PLAN/ACT 模板（prompt_key=None），
+# code-engineer 由 harness 自研内核（ADR-019，前端直连 /api/harness）执行，
 # tool_whitelist / model_policy 均为 null（= 全部注册工具 / 回落全局模型映射）。
 _BASE_PROFILES: tuple[dict[str, str | None], ...] = (
     {
@@ -40,11 +40,11 @@ _BASE_PROFILES: tuple[dict[str, str | None], ...] = (
     {
         "key": "code-engineer",
         "display_name": "代码工程师",
-        "description": "计划确认后执行代码任务：工具调用、检查回灌、hunk 评审、门禁提交",
+        "description": "自研内核（harness）驱动的代码任务智能体：工具调用、检查回灌、hunk 评审",
         "prompt_key": None,
         "tool_whitelist": None,
-        "engine_kind": "agentdesk_bridge",
-        "default_mode": "confirm",
+        "engine_kind": "harness",
+        "default_mode": None,
         "model_policy": None,
     },
 )

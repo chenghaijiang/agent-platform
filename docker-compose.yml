@@ -89,14 +89,14 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    environment: *app_env
+    environment:
+      <<: *app_env
+      # ADR-019：harness 网关上游（Node sidecar 协议服务器，compose 内网）
+      HARNESS_BASE_URL: http://harness:4173
     # 本地模型形态：宿主机 Ollama/vLLM 经 host.docker.internal 访问；
     # macOS Docker Desktop 自带该域名，Linux 需此显式映射到宿主网关（Desktop 上同样兼容）
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      # T11（ADR-013）：Agent 执行域工作区根（Task 级隔离目录 workspaces/<task_id>/），app/worker 共享同一卷
-      - agent_platform_workspaces_data:/app/workspaces
     ports:
       - "8000:8000"
     healthcheck:
@@ -121,9 +121,6 @@ services:
     # 与 app 一致：本地模型形态下 worker 也要访问宿主 Ollama/vLLM 做 embedding
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      # T11：与 app 共享工作区卷——Agent 任务的执行进程（T13 起）在 worker 侧读写 Task 目录
-      - agent_platform_workspaces_data:/app/workspaces
     healthcheck:
       # slim 镜像无 ps/pgrep；worker 内置 TCP 健康端口，连接成功即存活
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 9101), 3).close()"]
@@ -360,9 +357,6 @@ volumes:
   agent_platform_pg_data:
     driver: local
   agent_platform_redis_data:
-    driver: local
-  # T11（ADR-013）：Agent 执行域工作区卷（Task 隔离目录根，命名卷便于随 compose 生命周期管理）
-  agent_platform_workspaces_data:
     driver: local
   minio_data:
     driver: local

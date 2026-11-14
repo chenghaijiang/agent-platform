@@ -611,21 +611,6 @@ async function sendQuestion() {
 /* ============================================================
    统一工作台（ADR-014~017 一期）：Profile 选择 · 消息信封渲染 · 会话流
    ============================================================ */
-const AGENT_EVENT_LABEL = {
-  task_created: "任务已创建",
-  task_status: "任务状态",
-  tool_start: "工具调用",
-  tool_result: "工具结果",
-  check_start: "自动检查",
-  check_result: "检查结果",
-  verify: "独立验证",
-  summary: "交付摘要",
-  approval_resolved: "审批已处理",
-  out_of_bounds: "越界拦截",
-  redline_blocked: "红线拦截",
-  delta: "叙述",
-  error: "执行失败",
-};
 
 function profileOf(key) {
   return state.profiles.find((p) => p.key === (key || "knowledge-assistant")) || null;
@@ -688,8 +673,6 @@ function renderEnvelope(m) {
     if (d.role === "user") { appendQuestion(inner, d.text || ""); return null; }
     return renderAssistantEnvelope(d);
   }
-  if (m.type === "agent_event") { renderAgentEvent(d); return null; }
-  if (m.type === "approval_card") { renderApprovalCard(d); return null; }
   return null;
 }
 
@@ -703,133 +686,6 @@ function renderAssistantEnvelope(d) {
   fillGov(block.querySelector(".gov-strip"), null);
   scrollBottom();
   return block;
-}
-
-function renderAgentEvent(d) {
-  // 桥接事件不带 event 字段（task_status data={status,note}、summary data={outcome,…}），按字段推断
-  const ev = d.event
-    || (d.status !== undefined ? "task_status"
-    : (d.outcome !== undefined ? "summary" : ""));
-  if (ev === "approval_resolved") markCardResolved(d); // 同步卡片为已决策（多端一致）
-  const warn = ev === "out_of_bounds" || ev === "redline_blocked" || ev === "error";
-  let detail = "";
-  if (ev === "task_status") detail = `${d.status || ""}${d.note ? " · " + d.note : ""}`;
-  else if (ev === "tool_start") detail = `${d.tool || ""}${d.args_preview ? " " + d.args_preview : ""}`;
-  else if (ev === "tool_result") detail = `${d.tool || ""} ${d.ok ? "完成" : "失败"}`;
-  else if (ev === "delta") detail = d.text || "";
-  else if (ev === "error") detail = d.error || "";
-  else if (ev === "summary") detail = `${d.outcome || ""}${d.steps !== undefined ? " · steps " + d.steps : ""}`;
-  else if (ev === "check_start" || ev === "check_result") detail = d.command || "";
-  else if (ev === "verify") detail = `${(d.criteria || []).length} 项判定`;
-  else detail = d.command || d.tool || d.note || "";
-  const label = AGENT_EVENT_LABEL[ev] || ev || "事件";
-  const el = document.createElement("div");
-  el.className = "evt-line" + (warn ? " warn" : "");
-  el.innerHTML = `<span class="evt-dot"></span><span class="evt-k">${esc(label)}</span>` +
-    `<span class="evt-d">${esc(String(detail).slice(0, 140))}</span>` +
-    (d.task_seq ? `<span class="evt-seq">#${d.task_seq}</span>` : "");
-  $("chat-inner").appendChild(el);
-}
-
-// ---------- 审批卡片（Q4A：按钮直接调既有 agentdesk 端点） ----------
-
-function settleCard(card, text) {
-  const actions = card.querySelector("[data-ap-actions]");
-  const done = card.querySelector("[data-ap-done]");
-  if (actions) actions.hidden = true;
-  if (done) {
-    done.hidden = false;
-    const t = card.querySelector("[data-ap-done-text]");
-    if (t) t.textContent = text;
-  }
-}
-
-function markCardResolved(d) {
-  if (!d.approval_id) return;
-  const card = document.querySelector(`[data-card-approval="${CSS.escape(String(d.approval_id))}"]`);
-  if (!card) return;
-  settleCard(
-    card,
-    d.decision === "deny" ? "已拒绝：Agent 停止执行该命令"
-      : d.decision === "always" ? "已允许：本项目后续同类命令免确认（已写入策略）"
-      : "已允许本次执行"
-  );
-}
-
-function renderApprovalCard(d) {
-  const inner = $("chat-inner");
-  const el = document.createElement("div");
-  el.className = "approval-card" + (d.kind === "plan_confirm" ? " plan-card" : "");
-  if (d.kind === "plan_confirm") {
-    // 计划确认卡片：确认后切自动执行 / 取消任务
-    el.dataset.cardTask = d.task_id;
-    const steps = (d.steps || []).map((s, i) => {
-      const title = typeof s === "string" ? s : (s.title || "");
-      const detail = typeof s === "string" ? "" : (s.detail || "");
-      return `<div class="ap-step"><span class="ap-idx">${String(i + 1).padStart(2, "0")}</span>` +
-        `<div><b>${esc(title)}</b>${detail ? `<br><span class="ap-detail">${esc(detail)}</span>` : ""}</div></div>`;
-    }).join("");
-    const risks = (d.risks || []).map((r) => `<div class="ap-risk">⚠ ${esc(r)}</div>`).join("");
-    el.innerHTML = `
-      <div class="ap-head"><b>执行计划</b><span class="ap-meta">${(d.steps || []).length} 步 · 待确认</span></div>
-      <div class="ap-body">${steps}${risks}</div>
-      <div class="ap-actions" data-ap-actions>
-        <button class="ap-btn primary" data-plan-action="approve">确认计划并执行</button>
-        <button class="ap-btn ghost" data-plan-action="cancel">取消任务</button>
-      </div>
-      <div class="ap-done" data-ap-done hidden><span data-ap-done-text></span></div>`;
-    el.querySelectorAll("[data-plan-action]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const action = btn.dataset.planAction;
-        try {
-          await api(`/agentdesk/tasks/${d.task_id}/plan/confirm`, {
-            method: "POST",
-            body: JSON.stringify({ action }),
-          });
-          settleCard(el, action === "approve" ? "计划已确认，任务继续执行" : "任务已取消");
-          toast(action === "approve" ? "已确认计划，任务继续执行" : "任务已取消");
-        } catch (err) {
-          toast(errText(err), true); // 重复确认/已推进 → 409
-        }
-      });
-    });
-  } else {
-    // 工具审批卡片：once / always / deny 三选
-    el.dataset.cardApproval = d.approval_id;
-    const [scopeTool, scopeLevel] = String(d.scope || "").split(":");
-    el.innerHTML = `
-      <div class="ap-head"><b>需要你确认</b><span class="ap-meta">${esc(scopeLevel || "")} ${esc(scopeTool || "")}</span></div>
-      <div class="ap-body">
-        <div class="ap-cmd"><span class="prompt">$</span>${esc(d.command || "")}</div>
-        <div class="ap-note">${esc(d.reason || "策略引擎要求人工审批。")}作用域：${esc(d.scope || "")}。</div>
-      </div>
-      <div class="ap-actions" data-ap-actions>
-        <button class="ap-btn primary" data-approve="once">仅本次允许</button>
-        <button class="ap-btn" data-approve="always">本项目总是允许</button>
-        <button class="ap-btn ghost" data-approve="deny">拒绝</button>
-      </div>
-      <div class="ap-done" data-ap-done hidden><span data-ap-done-text></span></div>`;
-    el.querySelectorAll("[data-approve]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const decision = btn.dataset.approve;
-        try {
-          await api(`/agentdesk/approvals/${d.approval_id}/decide`, {
-            method: "POST",
-            body: JSON.stringify({ decision }),
-          });
-          settleCard(el, decision === "deny" ? "已拒绝：Agent 停止执行该命令"
-            : decision === "always" ? "已允许：本项目后续同类命令免确认（已写入策略）"
-            : "已允许本次执行");
-          toast(decision === "deny" ? "已拒绝。Agent 将收到拒绝反馈并自纠"
-            : decision === "always" ? "已写入项目策略：同类命令免确认"
-            : "已允许本次命令");
-        } catch (err) {
-          toast(errText(err), true); // 双击/已被他端决策 → 409
-        }
-      });
-    });
-  }
-  inner.appendChild(el);
 }
 
 // ---------- 会话流：fetch SSE + Last-Event-ID 续传（无终态帧，断线自动重连） ----------
@@ -901,7 +757,6 @@ function onStreamFrame(frame) {
     seq: payload.seq !== undefined ? payload.seq : seq,
     type,
     data: payload.data || {},
-    task_id: payload.task_id || null,
   };
   // POST SSE 直播期间 user 帧由 POST 流通道渲染（乐观气泡 + 落库文本替换）；
   // 落库文本可能已脱敏，与乐观原文不再相等，文本匹配去重不可靠 → sending 期间仅记账

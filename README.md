@@ -138,6 +138,19 @@
 - 现有 web/ 顶栏增加「Agent 工作台」入口（独立功能域新窗口打开，双功能域并存，Q1 决策），
   登录与账号体系复用（zs_token/zs_user 同一 localStorage 契约）。
 
+### Agent 工作台 v2：agent-harness sidecar（ADR-019）
+- 首页「Agent 工作台」入口改指 `/harness/index.html`（harness 自带无构建客户端，知源品牌 + 平台登录态；
+  `web/agentdesk.html/js/css` 前端退役删除；AgentDesk 后端随后整体退役：执行域代码与数据层五表删除（迁移 0011），
+  Agent 能力由 harness sidecar 全量承接；
+- harness 源码入库 `services/agent-harness/`（Node ≥22 pnpm monorepo：自研内核 TurnMachine + 工具波次调度 +
+  审批 + Context Compact + Subagent + Skills + 任务看板 + 内置 KB），compose 服务名 `harness`（内网 4173，不映射宿主端口）；
+- 平台网关 `/api/harness/{path}`（require_auth）反向代理到 sidecar：方法/查询串/请求体透传，SSE 流式透传，
+  平台凭证不下渗；上游不可达统一 502；
+- 前端改造点：所有请求加 `/api/harness` 前缀 + Bearer 注入（hw() 统一入口）+ 401 跳平台登录 +
+  EventSource 改 fetch 流式（EventSource 无法带 Authorization）。
+  模型出口由 entrypoint 以 MODEL_GATEWAY_* 同源 env 生成 config.yaml（与 app 同上游）。
+  本地裸跑 sidecar：`cd services/agent-harness && pnpm install && pnpm build && pnpm serve`（HOST/PORT 可覆写）。
+
 ### 审计域展示（T16）
 - 用户与权限页新增「审计事件」面板：按功能域筛选（Agent 工作台 / 知识问答 / 知识库），
   agentdesk 域五种 action（tool_call / out_of_bounds / redline_blocked / task_committed / approval_decided）
@@ -147,8 +160,8 @@
 
 | 边界 | 口径 |
 | --- | --- |
-| 隔离级别 | **路径隔离，非容器沙箱**：owns 约束、红线正则、四档模式在策略引擎层求值拦截（ADR-013 四层安全模型），工具执行限定在任务工作区目录内；生产部署建议叠加容器级隔离 |
-| 模型依赖 | **Agent 域（AgentDesk）需真实模型 key**：执行图走模型网关 `chat_tools` tool-calling，fake-openai 不支持工具调用协议；**RAG 域（知识问答）fake 即跑**：演示容器形态下全链路可演示 |
+| 隔离级别 | **路径隔离，非容器沙箱**：Agent 执行由 harness 内核侧权限引擎（执行模式 + 审批）在工具执行前拦截（ADR-019）；生产部署建议叠加容器级隔离 |
+| 模型依赖 | **Agent 域（harness sidecar）需真实模型 key**：内核走 OpenAI-compatible tool-calling，fake-openai 不支持工具调用协议；**RAG 域（知识问答）fake 即跑**：演示容器形态下全链路可演示 |
 | 交付证据 | MVP 以 diff 评审 + pytest/ruff 检查门禁 + 独立验证作为交付证据；demo 中的沙箱内实时页面预览属完整版能力，当前版本未包含 |
 
 ## ZCode 借鉴声明（T16）
@@ -181,7 +194,7 @@ AgentDesk 的产品骨架与交互范式参考开源项目 **zai-org/ZCode（v3.
 | app | 自建（uv + FastAPI） | 8000 | 平台应用骨架，启动前自动执行 Alembic 迁移 |
 | db | pgvector/pgvector:pg17 | 127.0.0.1:15432 | 平台主库（用户/ACL/任务队列/Checkpoint/向量），initdb 自动启用 vector 扩展 |
 | redis | redis:7 | 127.0.0.1:16379 | 平台缓存/限流/登录态 |
-| worker | 自建（与 app 同镜像） | - | 双队列消费者：入库流水线 + Agent 任务（SKIP LOCKED 租约认领 PG 队列，ADR-005）；入库：解析/切分/向量化；agent：认领后跑执行图至挂起/终态 |
+| worker | 自建（与 app 同镜像） | - | 入库队列消费者（SKIP LOCKED 租约认领 PG 队列，ADR-005）：解析/切分/向量化；Agent 执行域队列随 AgentDesk 退役删除（ADR-019，执行由 harness sidecar 承接） |
 | minio | chainguard/minio | 127.0.0.1:9001 | 平台对象存储（文档原文，S3 API；容器 9000 → 宿主 9001） |
 | fake-openai | 自建（python:3.12-slim，仅标准库） | 127.0.0.1:8100 | OpenAI-compatible 演示服务（T03）：带 usage 的标准响应，免真实 key 演示网关与观测链路 |
 | langfuse-web | langfuse/langfuse:4 | 3000 | 观测 UI（Trace/评测/Prompt 版本） |
@@ -260,17 +273,19 @@ uv run alembic revision -m "..."   # 生成新迁移
 
 ```text
 agent-platform/
-├── docker-compose.yml        # 12 服务编排（ADR-004 单机部署单元）
+├── docker-compose.yml        # 13 服务编排（ADR-004 单机部署单元；harness 为 ADR-019 sidecar）
 ├── Dockerfile                # uv 基础镜像，依赖层/应用层分离
 ├── docker/initdb/01-extensions.sql   # 平台库自动启用 pgvector
-├── alembic/                  # 迁移链 0001→0009（accounts / kb_metadata / ingestion / chat / audit / prompts / agentdesk / hunks_queue）
+├── services/agent-harness/   # ADR-019：agent-harness sidecar（Node monorepo：内核+协议服务器+客户端；Dockerfile/entrypoint 入库）
+├── alembic/                  # 迁移链 0001→0011（accounts / kb_metadata / ingestion / chat / audit / prompts / agentdesk / hunks_queue / workbench / drop_agentdesk）
 ├── tools/fake-openai/        # OpenAI-compatible 演示服务（T03，免真实 key）
 ├── prompts/chat_qa.yaml      # 问答系统提示词（启动登记 → 版本化发布，T10）
 ├── evals/                    # 金标集 golden_set.jsonl + run_eval.py 回归（T10，结果存 results/）
-├── web/                      # 前端（纯静态，main.py StaticFiles 兜底挂载）：T09 知识问答三件套 + T15 AgentDesk 工作台（agentdesk.html/js/css）+ 交互规格（agentdesk-demo.html）
+├── web/                      # 前端（纯静态，main.py StaticFiles 兜底挂载）：T09 知识问答 + 统一工作台（app.js/index.html）+
+│                             #   ADR-019 Agent 工作台 v2（web/harness/，经认证网关访问）+ 交互规格（agentdesk-demo.html）
 ├── src/agent_platform/
 │   ├── main.py               # FastAPI 入口：/healthz /readyz + 全部路由装配 + 静态挂载（挂载须在最后）
-│   ├── core/                 # 12-Factor 配置（含模型映射表）+ 口令加盐哈希
+│   ├── core/                 # 12-Factor 配置（含模型映射表 / harness_base_url）+ 口令加盐哈希
 │   ├── db/                   # ORM 全部表 + 会话工厂 + 幂等 seed
 │   ├── auth/                 # AuthProvider 协议 + 本地口令实现 + fake OIDC + 依赖装配（ADR-006）
 │   ├── model_gateway/        # T03：统一 chat/embed 出口 + 错误族 + Langfuse 上报 + admin self-test
@@ -280,8 +295,9 @@ agent-platform/
 │   ├── chat/                 # T07：LangGraph 图 + 会话/Run API + SSE
 │   ├── guardrails/           # T08：输入脱敏 + 输出敏感识别
 │   ├── prompts/              # T10：版本表读写 + publish/current API
-│   └── agentdesk/            # T11–T14：数据层 + 工作区 + 策略引擎（policy.py）+ 工具层（tools.py）+ 执行图（graph.py）+ 驱动器（runner.py）+ 模型抽象（llm.py）+ API 面（api.py，含 SSE）+ 演示仓
-├── tests/                    # 284 单测
+│   ├── workbench/            # 统一工作台（ADR-014~017）：Profile 可选 + 会话/消息/SSE（qa_graph 引擎直播；harness 引擎由前端直连 /api/harness）
+│   └── harness/              # ADR-019：agent-harness 网关（catch-all /api/harness/* 反代 + require_auth + SSE 流式）
+├── tests/                    # 单测（含 tests/test_harness_gateway.py 网关契约）
 ├── .env.example              # 环境变量样例（含密钥生成命令）
 └── README.md
 ```

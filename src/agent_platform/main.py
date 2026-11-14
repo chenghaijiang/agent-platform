@@ -15,12 +15,6 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from agent_platform.agentdesk.api import router as agentdesk_router
-from agent_platform.agentdesk.graph import build_agent_graph
-from agent_platform.agentdesk.llm import GatewayInvoker
-from agent_platform.agentdesk.runner import AgentDeskRunner
-from agent_platform.agentdesk.tools import ToolExecutor
-from agent_platform.agentdesk.workspace import WorkspaceManager
 from agent_platform.api import admin_audit, admin_kbs, admin_users, me
 from agent_platform.auth.router import router as auth_router
 from agent_platform.chat.api import router as chat_router
@@ -35,6 +29,7 @@ from agent_platform.model_gateway.gateway import ModelGateway
 from agent_platform.prompts.api import router as prompts_router
 from agent_platform.retrieval.api import router as retrieval_router
 from agent_platform.retrieval.service import RetrievalService
+from agent_platform.workbench.api import router as workbench_router
 
 
 async def _seed_prompt_baseline(session_factory) -> None:
@@ -100,21 +95,6 @@ async def lifespan(app: FastAPI):
         retrieval=retrieval_service,
         gateway=app.state.model_gateway,
         checkpointer=checkpointer,
-    )
-    # T13 起：Agent 执行图（thread_id=task_id，同一 Checkpointer 持久化，重启可恢复审批等待态）
-    workspaces = WorkspaceManager(Path(settings.agentdesk_workspaces_dir))
-    app.state.agent_runner = AgentDeskRunner(
-        build_agent_graph(
-            session_factory=app.state.session_factory,
-            workspace_manager=workspaces,
-            executor=ToolExecutor.from_settings(workspaces),
-            invoker=GatewayInvoker(app.state.model_gateway),
-            checkpointer=checkpointer,
-            max_steps=settings.agentdesk_max_steps,
-            max_total_tokens=settings.agentdesk_max_total_tokens,
-            max_check_rounds=settings.agentdesk_max_check_rounds,
-        ),
-        app.state.session_factory,
     )
     # T10：Prompt 模板基线 seed（表空时从 prompts/ 目录导入 v1 并发布，幂等）
     await _seed_prompt_baseline(app.state.session_factory)

@@ -1,11 +1,10 @@
-"""统一工作台桥接层单测（ADR-014~017 一期验收，Q17A：CI 覆盖桥接最脆的面）。
+"""统一工作台渠道层单测（ADR-014~017 一期验收，Q17A：CI 覆盖最脆的面）。
 
 覆盖：
 - Profile 列表 / 会话绑定（默认、显式、未知 422）；
 - qa_graph 引擎：SSE delta/done + 消息信封落库（user 先行、assistant 收尾）+ 回放游标；
-- agentdesk_bridge 引擎：一条消息创建一个 Task（chat_session_id 归属）+ 202；
-- 惰性桥接：task_events 增量 → chat_messages（plan/approval_required → 审批卡片）+ 幂等；
-- stream 端点：Last-Event-ID 回放 + 直播新消息（含卡片帧）；
+- 非 QA 引擎（harness）不经本端点：send_message 如实 501（前端直连 /api/harness，ADR-019）；
+- stream 端点：Last-Event-ID 回放 + 直播新落库消息；
 - fallback 链：resolve_model_chain 解析 + stream_chat_with_fallback 首帧前换模/中途如实抛 +
   图内换模审计（workbench.model_fallback）。
 
@@ -26,18 +25,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 import agent_platform.workbench.api as workbench_api
-from agent_platform.agentdesk import service as agentdesk_service
 from agent_platform.api.deps import get_session
 from agent_platform.auth.deps import require_auth
 from agent_platform.auth.provider import AuthContext
 from agent_platform.chat.graph import build_chat_graph
-from agent_platform.db.models import (
-    AgentTask,
-    AuditEvent,
-    Base,
-    ChatMessage,
-    ChatSession,
-)
+from agent_platform.db.models import AuditEvent, Base, ChatMessage
 from agent_platform.db.seed import run_seed
 from agent_platform.model_gateway.errors import ModelUnavailableError
 from agent_platform.model_gateway.resilience import stream_chat_with_fallback
@@ -119,9 +111,6 @@ async def _messages(factory, session_id: uuid.UUID) -> list[ChatMessage]:
 @pytest_asyncio.fixture()
 async def env(tmp_path, monkeypatch):
     monkeypatch.setattr("agent_platform.workbench.api.SSE_POLL_INTERVAL_SECONDS", 0.05)
-    monkeypatch.setattr(
-        "agent_platform.core.config.settings.agentdesk_workspaces_dir", str(tmp_path / "workspaces")
-    )
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'wb.db'}")
     # SQLite 默认不启用外键；删除会话的级联测试需要显式开启（与 test_kb_api 同模式）
 
@@ -188,17 +177,14 @@ async def test_create_session_unknown_profile_422(env):
     assert resp.status_code == 422
 
 
-async def test_delete_session_cascades_and_unbinds_tasks(env):
-    """删除会话：消息/Run 级联清除，名下任务解绑留档（FK ondelete=SET NULL）。"""
+async def test_delete_session_cascades_messages(env):
+    """删除会话（硬删）：聊天流级联清除，重复删除/访问 404。"""
     session_id = uuid.UUID(
-        (await env.post("/api/workbench/sessions", json={"profile_key": "code-engineer"})).json()["id"]
+        (await env.post("/api/workbench/sessions", json={})).json()["id"]
     )
-    body = (
-        await env.post(
-            f"/api/workbench/sessions/{session_id}/messages", json={"question": "修 bug"}
-        )
-    ).json()
-    task_id = uuid.UUID(body["task_id"])
+    await env.post(
+        f"/api/workbench/sessions/{session_id}/messages", json={"question": "报销截止日？"}
+    )
 
     resp = await env.delete(f"/api/workbench/sessions/{session_id}")
     assert resp.status_code == 204
@@ -208,9 +194,6 @@ async def test_delete_session_cascades_and_unbinds_tasks(env):
     assert (await env.get(f"/api/workbench/sessions/{session_id}/messages")).status_code == 404
 
     async with env._factory() as session:
-        task = await session.get(AgentTask, task_id)
-        assert task is not None
-        assert task.chat_session_id is None  # 任务留档、脱离会话
         msgs = list(
             (
                 await session.scalars(
@@ -343,10 +326,11 @@ async def test_qa_model_override_reaches_gateway(env):
     assert env._gateway.calls[1]["model"] is None
 
 
-# ---------------- agentdesk_bridge 引擎：创建任务 + 惰性桥接 ----------------
+# ---------------- 非 QA 引擎：不经本端点（ADR-019） ----------------
 
 
-async def test_bridge_message_creates_task_belonging_to_session(env):
+async def test_non_qa_engine_send_message_501(env):
+    """harness 引擎不经本端点（前端直连 /api/harness）：如实 501，不产生 assistant 信封。"""
     session_id = uuid.UUID(
         (await env.post("/api/workbench/sessions", json={"profile_key": "code-engineer"})).json()["id"]
     )
@@ -354,73 +338,11 @@ async def test_bridge_message_creates_task_belonging_to_session(env):
         f"/api/workbench/sessions/{session_id}/messages",
         json={"question": "修复 pricing.py 边界 bug"},
     )
-    assert resp.status_code == 202
-    body = resp.json()
-    assert body["profile_key"] == "code-engineer"
-
-    task_id = uuid.UUID(body["task_id"])
-    async with env._factory() as session:
-        from agent_platform.db.models import AgentTask
-
-        task = await session.get(AgentTask, task_id)
-        assert task.chat_session_id == session_id  # 归属（ADR-015 决策 4）
-        assert task.mode == "confirm"  # profile.default_mode
-        assert task.status == "created"  # 入队，Worker 认领
-
-    # 消息流：user 文本 + task_created 事件
+    assert resp.status_code == 501
+    # 用户消息本身落库（提问是事实），但无 assistant 回复信封
     rows = await _messages(env._factory, session_id)
-    assert [m.type for m in rows] == ["text", "agent_event"]
-    assert json.loads(rows[0].data)["text"] == "修复 pricing.py 边界 bug"
-    assert json.loads(rows[1].data)["task_id"] == body["task_id"]
-
-
-async def test_bridge_task_events_lazily_converted_to_cards(env):
-    """task_events 增量 → chat_messages：plan 与 approval_required 转审批卡片，幂等。"""
-    session_id = uuid.UUID(
-        (await env.post("/api/workbench/sessions", json={"profile_key": "code-engineer"})).json()["id"]
-    )
-    body = (
-        await env.post(
-            f"/api/workbench/sessions/{session_id}/messages", json={"question": "修 bug"}
-        )
-    ).json()
-    task_id = uuid.UUID(body["task_id"])
-
-    async with env._factory() as session:
-        await agentdesk_service.append_event(
-            session, task_id, "plan", {"steps": ["定位", "修复"], "risks": []}
-        )
-        await agentdesk_service.append_event(
-            session, task_id, "approval_required", {"approval_id": "a-1", "command": "pytest -q"}
-        )
-        await agentdesk_service.append_event(session, task_id, "tool_start", {"tool": "read_files"})
-        await session.commit()
-
-        task = await session.get(AgentTask, task_id)
-        chat_session = await session.get(ChatSession, session_id)
-        count = await service.bridge_task_events(session, chat_session, task)
-        assert count == 4  # 首条 task_status(created) + plan + approval_required + tool_start
-
-        rows = await _messages(env._factory, session_id)
-    bridged = rows[2:]  # 前两条是 user 文本 + task_created
-    assert [m.type for m in bridged] == [
-        "agent_event",  # task_status created
-        "approval_card",  # plan → 计划确认卡片
-        "approval_card",  # approval_required → 工具审批卡片
-        "agent_event",  # tool_start
-    ]
-    plan_card = json.loads(bridged[1].data)
-    assert plan_card["kind"] == "plan_confirm"  # 计划确认卡片（Q4A）
-    assert plan_card["task_seq"] == 2
-    approval_card = json.loads(bridged[2].data)
-    assert approval_card["approval_id"] == "a-1"
-    assert approval_card["task_id"] == body["task_id"]
-
-    # 幂等：无新增事件再桥接为 0 条
-    async with env._factory() as session:
-        task = await session.get(AgentTask, task_id)
-        chat_session = await session.get(ChatSession, session_id)
-        assert await service.bridge_task_events(session, chat_session, task) == 0
+    assert [m.type for m in rows] == ["text"]
+    assert json.loads(rows[0].data)["role"] == "user"
 
 
 async def _call_stream(
@@ -481,29 +403,26 @@ async def _call_stream(
 
 
 async def test_session_stream_replays_and_lives(env):
-    """会话 SSE：连接即回放（含卡片帧），尾随直播新消息。"""
+    """会话 SSE：连接即回放存量消息，尾随直播新落库消息。"""
     session_id = uuid.UUID(
-        (await env.post("/api/workbench/sessions", json={"profile_key": "code-engineer"})).json()["id"]
+        (await env.post("/api/workbench/sessions", json={})).json()["id"]
     )
-    body = (
-        await env.post(
-            f"/api/workbench/sessions/{session_id}/messages", json={"question": "修 bug"}
-        )
-    ).json()
-    task_id = uuid.UUID(body["task_id"])
+    # 先落一对 QA 信封（user + assistant）
+    await env.post(f"/api/workbench/sessions/{session_id}/messages", json={"question": "报销截止日？"})
+    # 再直落一条消息（模拟其他写入方，不经本进程 POST 通道）
     async with env._factory() as session:
-        await agentdesk_service.append_event(session, task_id, "plan", {"steps": ["s1"]})
+        await service.append_message(
+            session, session_id, "text", {"role": "assistant", "text": "补充说明"}
+        )
         await session.commit()
 
-    frames = await _call_stream(env, session_id, max_frames=4)
-    # 回放序：user 文本 / task_created / task_status(created) 桥接 / plan 卡片
-    assert [fid for fid, _, _ in frames] == [1, 2, 3, 4]
-    events = [e for _, e, _ in frames]
-    assert events[0] == "text"
-    assert "agent_event" in events
-    assert "approval_card" in events  # plan → 计划确认卡片帧
-    card = next(d for _, e, d in frames if e == "approval_card")
-    assert card["data"]["kind"] == "plan_confirm"
+    frames = await _call_stream(env, session_id, max_frames=3)
+    # 回放序：user 文本 / assistant 回答 / 追加消息
+    assert [fid for fid, _, _ in frames] == [1, 2, 3]
+    assert [e for _, e, _ in frames] == ["text", "text", "text"]
+    assert frames[0][2]["data"]["role"] == "user"
+    assert frames[1][2]["data"]["role"] == "assistant"
+    assert frames[2][2]["data"]["text"] == "补充说明"
 
 
 async def test_session_stream_resume_from_last_event_id(env):

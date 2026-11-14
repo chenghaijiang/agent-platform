@@ -1,18 +1,14 @@
-"""统一工作台 API（ADR-014~017 一期）：Profile 可选 + 会话绑定 + 双引擎发消息 + SSE 续传。
+"""统一工作台 API（ADR-014~017 一期）：Profile 可选 + 会话绑定 + QA 发消息 + SSE 续传。
 
 - GET  /api/workbench/profiles：可选智能体列表（enabled）；
 - POST /api/workbench/sessions：创建会话并绑定智能体（缺省 knowledge-assistant，
   Q3A：换智能体 = 开新会话）；GET 列表带 profile_key；
 - GET  /api/workbench/sessions/{id}/messages?after_seq=：消息回放（重启重建聊天流）；
-- POST /api/workbench/sessions/{id}/messages：双引擎路由——
-  qa_graph → SSE 直播（delta/done 帧，消息信封落库 + Run 记录，复用现有 QA 图）；
-  agentdesk_bridge → 创建 AgentTask（chat_session_id 归属 + 202），进度经流端点
-  惰性桥接 task_events → chat_messages（service.bridge_task_events）；
+- POST /api/workbench/sessions/{id}/messages：qa_graph 引擎 SSE 直播（delta/done 帧，
+  消息信封落库 + Run 记录）；非 QA 引擎（harness 等）不经本端点——前端直连
+  /api/harness（ADR-019），此处如实 501；
 - GET  /api/workbench/sessions/{id}/stream：会话级 SSE——连接即回放 Last-Event-ID
-  之后的消息（含卡片），再轮询尾随直播；帧 id=seq 即续传游标。
-
-审批卡片按钮直接调既有 agentdesk 端点（plan/confirm、approvals/{id}/decide，Q4A），
-决策后的事件流经桥接自动回到聊天流——本模块不复制任何审批逻辑。
+  之后的消息，再轮询尾随直播；帧 id=seq 即续传游标。
 """
 
 import asyncio
@@ -25,8 +21,6 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_platform.agentdesk import service as agentdesk_service
-from agent_platform.agentdesk.workspace import WorkspaceManager
 from agent_platform.api.deps import get_session
 from agent_platform.auth.deps import require_auth
 from agent_platform.auth.provider import AuthContext
@@ -131,8 +125,7 @@ async def delete_session(
 ) -> Response:
     """删除会话（硬删）：聊天流与 Run 记录一并清除。
 
-    级联语义由 FK 预留（ADR-015 决策 4）：chat_messages / chat_runs ondelete=CASCADE，
-    agent_tasks.chat_session_id ondelete=SET NULL（任务留档、脱离会话）；
+    级联语义由 FK 预留：chat_messages / chat_runs ondelete=CASCADE；
     LangGraph checkpoint 按 thread_id 残留无归属引用，无业务影响。
     """
     factory = request.app.state.session_factory
@@ -155,7 +148,7 @@ async def replay_messages(
     session: AsyncSession = Depends(get_session),
     after_seq: int = 0,
 ) -> dict:
-    """按 seq 游标回放消息（text / agent_event / approval_card 信封）。"""
+    """按 seq 游标回放消息（text 信封）。"""
     chat_session = await chat_service.get_owned_session(session, session_id, auth.user_id)
     if chat_session is None:
         raise HTTPException(status_code=404, detail="session not found")
@@ -177,15 +170,14 @@ async def send_message(
     request: Request,
     auth: AuthContext = Depends(require_auth),
 ) -> StreamingResponse | JSONResponse:
-    """发消息：按会话绑定智能体的 engine_kind 路由（Q9A 桥接，零改既有两域）。"""
+    """发消息：按会话绑定智能体的 engine_kind 路由（qa_graph 直跑现有 RAG 图）。"""
     factory = request.app.state.session_factory
     async with factory() as session:
         chat_session, profile = await _owned_session_with_profile(session, session_id, auth)
         chat_session_id = chat_session.id
         thread_id = chat_session.thread_id
         # 用户消息落库前输入脱敏（ADR-007）：敏感原文不进聊天流/检索/模型上下文，
-        # 命中即审计 guard.input_masked（图内 input_guard 对历史兜底，不重复计数）。
-        # agentdesk goal 保持原文：执行域需要完整任务语义，域内自有 policy/红线审计
+        # 命中即审计 guard.input_masked（图内 input_guard 对历史兜底，不重复计数）
         screened = screen_text(payload.question)
         user_message = await service.append_message(
             session, chat_session_id, "text", {"role": "user", "text": screened.text}
@@ -217,10 +209,8 @@ async def send_message(
             user_message.seq,
             payload.model,
         )
-    if profile.engine_kind == "agentdesk_bridge":
-        return await _bridge_dispatch(request, auth, chat_session_id, payload, profile)
-    # runtime 引擎为二期自研内核预留位（ADR-015），一期如实 501
-    raise HTTPException(status_code=501, detail=f"engine '{profile.engine_kind}' not available yet")
+    # harness 等引擎不经本端点（前端直连 /api/harness，ADR-019）；未知引擎如实 501
+    raise HTTPException(status_code=501, detail=f"engine '{profile.engine_kind}' not available here")
 
 
 async def _qa_stream(
@@ -325,11 +315,12 @@ async def _qa_stream(
         except (ModelGatewayError, Exception) as exc:  # noqa: BLE001 - SSE 内不能抛裸异常
             async with factory() as session:
                 await chat_service.record_run_end(session, run_id, error=f"{type(exc).__name__}: {exc}")
+                # 错误以 assistant 文本信封落库：回放时与其他消息同路渲染，不留专用类型
                 await service.append_message(
                     session,
                     chat_session_id,
-                    "agent_event",
-                    {"event": "error", "error": f"{type(exc).__name__}: {exc}", "role": "assistant"},
+                    "text",
+                    {"role": "assistant", "text": f"出错了：{exc}"},
                 )
                 await session.commit()
             yield _sse(0, "error", {"message": f"{type(exc).__name__}: {exc}", "user_seq": user_seq})
@@ -337,48 +328,7 @@ async def _qa_stream(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-async def _bridge_dispatch(
-    request: Request,
-    auth: AuthContext,
-    chat_session_id: uuid.UUID,
-    payload: SendMessageRequest,
-    profile,
-) -> JSONResponse:
-    """agentdesk_bridge 引擎：一条驱动消息创建一个 AgentTask（会话 1↔N，ADR-015 决策 4）。
-
-    执行归既有 Worker 认领（SKIP LOCKED）；进度/审批卡片经 stream 端点惰性桥接
-    task_events → chat_messages。审批按钮调既有 agentdesk 端点（Q4A）。
-    """
-    factory = request.app.state.session_factory
-    async with factory() as session:
-        chat_session = await chat_service.get_owned_session(session, chat_session_id, auth.user_id)
-        if chat_session is None:  # pragma: no cover - 调用方已校验，防御性兜底
-            raise HTTPException(status_code=404, detail="session not found")
-        task = await agentdesk_service.create_task(
-            session,
-            goal=payload.question,
-            owns=[],
-            mode=profile.default_mode or "confirm",
-            title=payload.question[:40],
-            user_id=auth.user_id,
-            workspace_manager=WorkspaceManager.from_settings(),
-        )
-        task.chat_session_id = chat_session_id  # 统一工作台归属（ADR-015 决策 4）
-        await service.append_message(
-            session,
-            chat_session_id,
-            "agent_event",
-            {"event": "task_created", "task_id": str(task.id), "status": task.status},
-            task_id=task.id,
-        )
-        await session.commit()
-    return JSONResponse(
-        status_code=202,
-        content={"task_id": str(task.id), "status": task.status, "profile_key": profile.key},
-    )
-
-
-# ---------- 会话级 SSE：回放 + 惰性桥接 + 尾随直播 ----------
+# ---------- 会话级 SSE：回放 + 尾随直播 ----------
 
 
 @router.get("/sessions/{session_id}/stream")
@@ -390,9 +340,8 @@ async def stream_session(
 ) -> StreamingResponse:
     """会话消息流：连接即回放 Last-Event-ID 之后的消息，再轮询尾随直播。
 
-    每轮先桥接会话名下各 AgentTask 的 task_events 增量（幂等高水位），
-    再读 chat_messages 增量下发；帧 id=seq（续传游标）。流由客户端断开收尾
-    （无终态 done 帧——会话生命周期长于单条任务）。
+    每轮读 chat_messages 增量下发；帧 id=seq（续传游标）。流由客户端断开收尾
+    （无终态 done 帧——会话生命周期长于单条问答）。
     """
     factory = request.app.state.session_factory
     async with factory() as session:
@@ -408,8 +357,6 @@ async def stream_session(
         nonlocal cursor
         while True:
             async with factory() as session:
-                for task in await service.session_tasks(session, chat_session_id):
-                    await service.bridge_task_events(session, chat_session, task)
                 messages = await service.list_messages(
                     session, chat_session_id, after_seq=cursor
                 )
@@ -421,7 +368,6 @@ async def stream_session(
                     "ts": m.created_at.isoformat() if m.created_at else None,
                     "type": m.type,
                     "data": data,
-                    "task_id": str(m.task_id) if m.task_id else None,
                 }
                 yield _sse(m.seq, m.type, payload)
             await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
