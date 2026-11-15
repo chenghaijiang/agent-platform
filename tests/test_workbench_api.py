@@ -544,3 +544,59 @@ async def test_graph_fallback_writes_audit(tmp_path):
     assert detail["from_model"] is None and detail["to_model"] == "m2"
     assert fallback_events[0].object_id == "knowledge-assistant"
     await engine.dispose()
+
+
+# ---------------- harness turn 索引（traceId ↔ 会话映射服务端化，ADR-019） ----------------
+
+
+async def test_hw_traces_roundtrip_and_dedup(env):
+    """批量幂等追加 + 回读：跨浏览器回放映射的数据底座（服务端权威，localStorage 降级为缓存）。"""
+    session_id = uuid.UUID(
+        (await env.post("/api/workbench/sessions", json={"profile_key": "code-engineer"})).json()["id"]
+    )
+    r1 = await env.post(
+        f"/api/workbench/sessions/{session_id}/hw-traces",
+        json={"trace_ids": ["trace-aaaa-1", "trace-aaaa-2"]},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["trace_ids"] == ["trace-aaaa-1", "trace-aaaa-2"]
+    # 重复追加：去重保序
+    r2 = await env.post(
+        f"/api/workbench/sessions/{session_id}/hw-traces",
+        json={"trace_ids": ["trace-aaaa-2", "trace-aaaa-3"]},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["trace_ids"] == ["trace-aaaa-1", "trace-aaaa-2", "trace-aaaa-3"]
+    got = await env.get(f"/api/workbench/sessions/{session_id}/hw-traces")
+    assert got.status_code == 200
+    assert got.json()["trace_ids"] == ["trace-aaaa-1", "trace-aaaa-2", "trace-aaaa-3"]
+
+
+async def test_hw_traces_ownership_404(env):
+    """归属校验不泄露存在性：他人会话读/写均 404。"""
+    session_id = uuid.UUID(
+        (await env.post("/api/workbench/sessions", json={})).json()["id"]
+    )
+    env._transport.app.dependency_overrides[require_auth] = lambda: OTHER
+    try:
+        resp = await env.post(
+            f"/api/workbench/sessions/{session_id}/hw-traces",
+            json={"trace_ids": ["trace-aaaa-1"]},
+        )
+        assert resp.status_code == 404
+        assert (await env.get(f"/api/workbench/sessions/{session_id}/hw-traces")).status_code == 404
+    finally:
+        env._transport.app.dependency_overrides[require_auth] = lambda: MEMBER
+
+
+async def test_hw_traces_validation_422(env):
+    """空数组与过短 trace_id 拒绝：前端 bug 不落脏索引。"""
+    session_id = uuid.UUID(
+        (await env.post("/api/workbench/sessions", json={})).json()["id"]
+    )
+    assert (
+        await env.post(f"/api/workbench/sessions/{session_id}/hw-traces", json={"trace_ids": []})
+    ).status_code == 422
+    assert (
+        await env.post(f"/api/workbench/sessions/{session_id}/hw-traces", json={"trace_ids": ["ab"]})
+    ).status_code == 422

@@ -111,6 +111,25 @@ function persistHwTraces() {
   localStorage.setItem("zs_hw_traces", JSON.stringify(flat));
 }
 
+/** 服务端 traceId 映射（hw_trace_ids，跨浏览器回放的权威副本）：与本地缓存合并；
+ *  本地独有（升级前仅存 localStorage 的旧索引）一次性补报服务端。失败静默退回本地缓存。 */
+async function mergeServerHwTraces(sessionId) {
+  try {
+    const body = await api(`/workbench/sessions/${sessionId}/hw-traces`);
+    const server = new Set(body.trace_ids || []);
+    const local = state.hwTraceIds.get(sessionId) || new Set();
+    state.hwTraceIds.set(sessionId, new Set([...server, ...local]));
+    persistHwTraces();
+    const missing = [...local].filter((t) => !server.has(t));
+    if (missing.length) {
+      await api(`/workbench/sessions/${sessionId}/hw-traces`, {
+        method: "POST",
+        body: JSON.stringify({ trace_ids: missing }),
+      });
+    }
+  } catch { /* 服务端不可达/旧后端：回放 gate 退回本地缓存集合 */ }
+}
+
 /* ============================================================
    登录 / 登出 / 启动恢复
    ============================================================ */
@@ -405,6 +424,8 @@ async function openSession(sessionId) {
       // Agent 会话：harness 渲染容器 + events 流（连接即 replay 本会话历史，按 traceId 过滤）
       inner.innerHTML = '<div class="chat-stream" id="hw-stream"></div><div class="hw-approvals" id="hw-approvals"></div>';
       resetHwSession();
+      // 服务端映射先合并再连流：replay 帧到达时 gate 集合必须已就绪（换浏览器/清存储后仍可回放）
+      await mergeServerHwTraces(sessionId);
       startHwStream();
       return;
     }
@@ -1192,8 +1213,8 @@ function restoreHwTranscript(entries) {
   resetHwSession();
   const set = state.hwTraceIds.get(state.currentSessionId);
   if (!set) {
-    // 映射丢失（跨浏览器/清存储）：历史不可回放，仅提示，不阻塞新对话
-    addErrorNote(hwSession, "该会话的历史在本浏览器没有回放索引（traceId 映射丢失），不影响继续对话");
+    // 服务端与本地均无索引（极老会话/上报全部失败）：历史不可回放，仅提示，不阻塞新对话
+    addErrorNote(hwSession, "该会话没有可回放的 trace 索引（服务端与本地均无映射），不影响继续对话");
     return;
   }
   let gate = false; // 游标：turn 结束后关闭，等待下一个 turn_started 重新判定归属
@@ -1396,10 +1417,16 @@ async function sendAgentTurn(text) {
     }
     // 绑定本 turn 与 platform 会话：replay 与 live 事件都按 traceId 归属
     if (payload && payload.traceId) {
-      const set = state.hwTraceIds.get(state.currentSessionId) || new Set();
+      const owner = state.hwActiveSession || state.currentSessionId; // 发起时会话（防发送途中切换）
+      const set = state.hwTraceIds.get(owner) || new Set();
       set.add(payload.traceId);
-      state.hwTraceIds.set(state.currentSessionId, set);
+      state.hwTraceIds.set(owner, set);
       persistHwTraces();
+      // 服务端持久化（跨浏览器回放）：fire-and-forget，失败不影响本轮对话
+      void api(`/workbench/sessions/${owner}/hw-traces`, {
+        method: "POST",
+        body: JSON.stringify({ trace_ids: [payload.traceId] }),
+      }).catch(() => {});
     } else {
       // 静默吞掉会让“刷新后回放失效”变成无头案：至少留一条可查的痕迹
       console.warn("[hw-turn] 响应无 traceId，未注册：", JSON.stringify(payload).slice(0, 120));

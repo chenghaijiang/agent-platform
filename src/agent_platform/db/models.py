@@ -176,6 +176,9 @@ class ChatSession(Base):
     # 会话级绑定智能体（ADR-014 决策 3）：软引用 agent_profiles.key；
     # null = knowledge-assistant（存量会话零迁移，换智能体 = 开新会话）
     profile_key: Mapped[str | None] = mapped_column(String(64))
+    # harness turn 索引（ADR-019）：该会话发起过的 harness traceId 全集（JSON 数组字符串，
+    # 保序去重）——服务端权威映射，前端 SSE replay 按其过滤回放（跨浏览器/清存储后仍可重建聊天流）
+    hw_trace_ids: Mapped[str | None] = mapped_column(Text())
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

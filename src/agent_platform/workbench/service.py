@@ -11,7 +11,7 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_platform.db.models import AgentProfile, ChatMessage
+from agent_platform.db.models import AgentProfile, ChatMessage, ChatSession
 
 # 默认智能体（ADR-014 决策 3）：存量会话 profile_key 为 null 时按此解释
 DEFAULT_PROFILE_KEY = "knowledge-assistant"
@@ -101,6 +101,35 @@ async def list_messages(
         .limit(limit)
     )
     return list((await session.scalars(stmt)).all())
+
+
+# ---------- harness turn 索引（ADR-019：traceId ↔ 会话映射服务端化） ----------
+
+
+def parse_hw_traces(chat_session: ChatSession) -> list[str]:
+    """hw_trace_ids（JSON 数组字符串）→ list；空/非法诚实回落空表（不阻塞回放兑底）。"""
+    if not chat_session.hw_trace_ids:
+        return []
+    try:
+        data = json.loads(chat_session.hw_trace_ids)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [t for t in data if isinstance(t, str)]
+
+
+async def add_hw_traces(
+    session: AsyncSession, chat_session: ChatSession, trace_ids: list[str]
+) -> list[str]:
+    """幂等追加 harness traceId（保序去重），返回合并后全集（前端回放 gate 集合的数据源）。"""
+    merged = parse_hw_traces(chat_session)
+    for tid in trace_ids:
+        if tid not in merged:
+            merged.append(tid)
+    chat_session.hw_trace_ids = json.dumps(merged, ensure_ascii=False)
+    await session.flush()
+    return merged
 
 
 def serialize_profile(profile: AgentProfile) -> dict:

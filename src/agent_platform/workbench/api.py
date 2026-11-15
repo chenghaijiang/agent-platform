@@ -4,6 +4,8 @@
 - POST /api/workbench/sessions：创建会话并绑定智能体（缺省 knowledge-assistant，
   Q3A：换智能体 = 开新会话）；GET 列表带 profile_key；
 - GET  /api/workbench/sessions/{id}/messages?after_seq=：消息回放（重启重建聊天流）；
+- GET/POST /api/workbench/sessions/{id}/hw-traces：harness turn 索引（traceId 全集，
+  幂等追加）——回放映射服务端化，换浏览器/清存储后仍可回放 Agent 会话历史（ADR-019）；
 - POST /api/workbench/sessions/{id}/messages：qa_graph 引擎 SSE 直播（delta/done 帧，
   消息信封落库 + Run 记录）；非 QA 引擎（harness 等）不经本端点——前端直连
   /api/harness（ADR-019），此处如实 501；
@@ -18,7 +20,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, constr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_platform.api.deps import get_session
@@ -47,6 +49,11 @@ class SendMessageRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     # 会话级模型覆盖（前端模型选择器）：None = 平台默认（settings.model_chat_model）
     model: str | None = Field(default=None, max_length=128)
+
+
+class HwTracesRequest(BaseModel):
+    # harness traceId 批量幂等追加（sendAgentTurn 单报 / 打开会话自愈补报）
+    trace_ids: list[constr(min_length=4, max_length=64)] = Field(min_length=1, max_length=200)
 
 
 def _sse(seq: int, event: str, payload: dict) -> str:
@@ -158,6 +165,38 @@ async def replay_messages(
         "after_seq": after_seq,
         "messages": [service.serialize_message(m) for m in messages],
     }
+
+
+# ---------- harness turn 索引（ADR-019：traceId ↔ 会话映射服务端化） ----------
+
+
+@router.get("/sessions/{session_id}/hw-traces")
+async def get_hw_traces(
+    session_id: uuid.UUID,
+    auth: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """该会话发起过的 harness traceId 全集（跨浏览器回放映射；换浏览器后仍可重建聊天流）。"""
+    chat_session = await chat_service.get_owned_session(session, session_id, auth.user_id)
+    if chat_session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"trace_ids": service.parse_hw_traces(chat_session)}
+
+
+@router.post("/sessions/{session_id}/hw-traces")
+async def append_hw_traces(
+    session_id: uuid.UUID,
+    payload: HwTracesRequest,
+    auth: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """幂等追加 harness traceId（sendAgentTurn 登记后上报），返回合并后全集。"""
+    chat_session = await chat_service.get_owned_session(session, session_id, auth.user_id)
+    if chat_session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    merged = await service.add_hw_traces(session, chat_session, list(payload.trace_ids))
+    await session.commit()
+    return {"trace_ids": merged}
 
 
 # ---------- 发消息：双引擎路由 ----------
