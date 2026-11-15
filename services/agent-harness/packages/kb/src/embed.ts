@@ -5,7 +5,9 @@
  * transport/5xx failures. "Ollama is offline" is a normal state, so every failure is a
  * structured EmbeddingError the caller can degrade on instead of an opaque crash.
  */
-export const DEFAULT_OLLAMA_URL = "http://localhost:11434";
+/** Ollama embedding 服务地址；HARNESS_OLLAMA_URL 覆盖（容器形态连宿主网关，对齐 HARNESS_KB_DB 惯例） */
+export const DEFAULT_OLLAMA_URL =
+  process.env["HARNESS_OLLAMA_URL"] ?? "http://localhost:11434";
 export const DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b";
 /** qwen3-embedding:0.6b → 1024 dims; must match the Qdrant collection size. */
 export const DEFAULT_EMBED_DIM = 1024;

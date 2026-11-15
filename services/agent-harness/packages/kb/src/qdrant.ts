@@ -5,7 +5,9 @@
  * plus deleteBySource so re-ingesting a changed file cannot leave stale vectors behind.
  * Every failure is a structured QdrantError — a stopped Qdrant is a normal, degradable state.
  */
-export const DEFAULT_QDRANT_URL = "http://localhost:6333";
+/** Qdrant 向量库地址；HARNESS_QDRANT_URL 覆盖（compose 内网服务，对齐 HARNESS_KB_DB 惯例） */
+export const DEFAULT_QDRANT_URL =
+  process.env["HARNESS_QDRANT_URL"] ?? "http://localhost:6333";
 /** Collection name for the personal knowledge base. */
 export const DEFAULT_COLLECTION = "harness_kb";
 export const DEFAULT_VECTOR_SIZE = 1024;
