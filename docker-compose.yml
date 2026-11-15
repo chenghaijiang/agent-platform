@@ -26,6 +26,8 @@ x-app-env: &app_env
   # T03 模型网关（v0.2 §5.5 M1）：映射表配置驱动，改 .env 四行即切模型零代码改动
   MODEL_GATEWAY_BASE_URL: ${MODEL_GATEWAY_BASE_URL:-http://fake-openai:8000/v1}
   MODEL_GATEWAY_API_KEY: ${MODEL_GATEWAY_API_KEY:-demo-key-not-for-prod}
+  # 服务间代理密钥（harness sidecar → /api/model-gateway/v1/*，未配置则代理关闭）
+  MODEL_GATEWAY_PROXY_KEY: ${MODEL_GATEWAY_PROXY_KEY:-}
   MODEL_CHAT_MODEL: ${MODEL_CHAT_MODEL:-demo-chat-1}
   MODEL_EMBEDDING_MODEL: ${MODEL_EMBEDDING_MODEL:-demo-embedding-1}
   # T05 对象存储（MinIO 平台实例）与入库任务参数
@@ -155,16 +157,21 @@ services:
 
   # harness 协议服务器（自研 Agent 内核：TurnMachine + 工具波次调度 + 审批 + Compact + KB）；
   # 平台形态下不直接暴露宿主机端口——FastAPI 网关（/api/harness/*，require_auth）反向代理；
-  # 模型出口由 entrypoint 生成的 config.yaml 指向平台 model_gateway 上游（与 app 同一组 env）
+  # 模型出口由 entrypoint 生成的 config.yaml 指向平台 OpenAI 兼容代理
+  # （root 语义：sidecar adapter 自行拼 /v1/chat/completions），
+  # 流量复用平台网关的 langfuse 包裹客户端 → sidecar 调用同口径上报 Langfuse
   harness:
     build: ./services/agent-harness
     image: agent-platform/harness:${APP_VERSION:-0.1.0}
     restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
     environment:
       HOST: 0.0.0.0
       PORT: 4173
-      MODEL_GATEWAY_BASE_URL: ${MODEL_GATEWAY_BASE_URL:-http://fake-openai:8000/v1}
-      MODEL_GATEWAY_API_KEY: ${MODEL_GATEWAY_API_KEY:-demo-key-not-for-prod}
+      MODEL_GATEWAY_BASE_URL: http://app:8000/api/model-gateway
+      MODEL_GATEWAY_API_KEY: ${MODEL_GATEWAY_PROXY_KEY:-}
       MODEL_CHAT_MODEL: ${MODEL_CHAT_MODEL:-demo-chat-1}
       # 可选覆盖：上下文窗口/最大输出/迭代上限/Qdrant 地址（默认 FTS-only 降级）
       # HARNESS_CONTEXT_WINDOW: 131072

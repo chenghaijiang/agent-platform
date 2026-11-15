@@ -5,8 +5,11 @@ from types import SimpleNamespace
 import httpx
 import openai
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
 from agent_platform.core.config import settings
+from agent_platform.model_gateway.api import proxy_router
 from agent_platform.model_gateway.errors import (
     ModelAuthError,
     ModelBadRequestError,
@@ -226,3 +229,128 @@ async def test_errors_are_gateway_family_not_sdk() -> None:
     gw._client.chat.completions.create = fail  # type: ignore[method-assign]
     with pytest.raises(ModelGatewayError):
         await gw.chat([{"role": "user", "content": "hi"}])
+
+
+# ---------------- 服务间 OpenAI 兼容代理（harness sidecar → Langfuse 同口径上报） ----------------
+
+
+def _relay_response(model: str) -> SimpleNamespace:
+    """带 model_dump 的响应对象（openai 响应是 pydantic 模型，代理按 dict 回传）。"""
+    payload = {"id": "chatcmpl-1", "model": model, "choices": [{"message": {"role": "assistant", "content": "pong"}}]}
+    return SimpleNamespace(model_dump=lambda: payload)
+
+
+async def test_relay_passthrough_non_stream() -> None:
+    """透传契约：请求体原样转发，响应按 dict 回传（Langfuse 上报由 drop-in 客户端承担）。"""
+    gw = _gateway()
+    captured = {}
+
+    async def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _relay_response(kwargs["model"])
+
+    gw._client.chat.completions.create = fake_create  # type: ignore[method-assign]
+    body = {"model": "demo-chat-1", "messages": [{"role": "user", "content": "ping"}], "temperature": 0.3}
+    result = await gw.relay_chat_completions(body)
+
+    assert captured == body  # 不改写、不丢弃字段（messages/model/temperature 全透传）
+    assert result["choices"][0]["message"]["content"] == "pong"
+
+
+async def test_relay_stream_frames_and_done() -> None:
+    """流式透传：逐 chunk 生成 SSE 帧，终结于 [DONE]。"""
+    gw = _gateway()
+
+    def chunk(text: str) -> SimpleNamespace:
+        return SimpleNamespace(model_dump_json=lambda: f"{{\"delta\":\"{text}\"}}")
+
+    async def fake_stream():
+        yield chunk("你")
+        yield chunk("好")
+
+    async def fake_create(**kwargs):
+        assert kwargs.get("stream") is True
+        return fake_stream()
+
+    gw._client.chat.completions.create = fake_create  # type: ignore[method-assign]
+    frames = await gw.open_relay_stream({"model": "demo-chat-1", "messages": [], "stream": True})
+    collected = [frame async for frame in frames]
+
+    assert collected[0] == 'data: {"delta":"你"}\n\n'
+    assert collected[1] == 'data: {"delta":"好"}\n\n'
+    assert collected[-1] == "data: [DONE]\n\n"
+
+
+async def test_relay_translates_upstream_error() -> None:
+    """上游错误翻译为 ModelGatewayError 族，代理端点据此回 502。"""
+    gw = _gateway()
+
+    async def fail(**kwargs):
+        raise _status_error(openai.AuthenticationError, 401)
+
+    gw._client.chat.completions.create = fail  # type: ignore[method-assign]
+    with pytest.raises(ModelAuthError):
+        await gw.relay_chat_completions({"model": "m", "messages": []})
+
+
+def _proxy_app(gateway: object) -> FastAPI:
+    app = FastAPI()
+    app.include_router(proxy_router)
+    app.state.model_gateway = gateway
+    return app
+
+
+async def _post_proxy(app: FastAPI, body: dict, *, key: str | None) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.post("/api/model-gateway/v1/chat/completions", json=body, headers=headers)
+
+
+async def test_proxy_endpoint_auth_matrix(monkeypatch) -> None:
+    """认证矩阵：未配置密钥=端点关闭（503）/错 key=401/对 key=200。"""
+    gateway = SimpleNamespace(
+        relay_chat_completions=lambda body: _async(_relay_response(body["model"]).model_dump()),
+    )
+    app = _proxy_app(gateway)
+    body = {"model": "demo-chat-1", "messages": [{"role": "user", "content": "ping"}]}
+
+    monkeypatch.setattr(settings, "model_gateway_proxy_key", "")
+    assert (await _post_proxy(app, body, key="whatever")).status_code == 503
+
+    monkeypatch.setattr(settings, "model_gateway_proxy_key", "secret-key")
+    assert (await _post_proxy(app, body, key="wrong")).status_code == 401
+    ok = await _post_proxy(app, body, key="secret-key")
+    assert ok.status_code == 200
+    assert ok.json()["choices"][0]["message"]["content"] == "pong"
+
+
+async def test_proxy_endpoint_stream_sse(monkeypatch) -> None:
+    """stream=true → text/event-stream，帧序完整含 [DONE]。"""
+
+    async def _frames(body):
+        yield 'data: {"delta":"hi"}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def _open_stream(body):
+        return _frames(body)  # 对齐真实 open_relay_stream：coroutine 返回 async generator
+
+    gateway = SimpleNamespace(open_relay_stream=_open_stream)
+    app = _proxy_app(gateway)
+    monkeypatch.setattr(settings, "model_gateway_proxy_key", "secret-key")
+    resp = await _post_proxy(app, {"model": "m", "messages": [], "stream": True}, key="secret-key")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    assert resp.text.endswith("data: [DONE]\n\n")
+
+
+async def test_proxy_endpoint_rejects_non_chat_payload(monkeypatch) -> None:
+    """非 chat/completions 形状的 payload 拒绝（400），不做盲转发。"""
+    monkeypatch.setattr(settings, "model_gateway_proxy_key", "secret-key")
+    app = _proxy_app(SimpleNamespace())
+    resp = await _post_proxy(app, {"input": "not-chat"}, key="secret-key")
+    assert resp.status_code == 400
+
+
+async def _async(value):
+    return value

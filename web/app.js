@@ -949,24 +949,54 @@ function addErrorNote(session, message) {
   (session.turnGroup ?? ensureTurn(session)).append(note);
 }
 
+// 打字机：delta/终稿只更新目标文本，渲染由定时器按固定速率追平（对齐问答模式的 typer 手感），
+// 避免 Ollama 大块 chunk 造成整段突现；回放路径无 live，仍整段直渲染。
+function startHwTyper(session) {
+  const live = session.live;
+  if (!live || live.timer) return;
+  live.timer = setInterval(() => {
+    if (session.live !== live) { clearInterval(live.timer); return; } // 会话已重建/切换
+    const target = stripThink(live.raw);
+    if (live.shown < target.length) {
+      live.shown = Math.min(target.length, live.shown + 4);
+      live.content.innerHTML = renderMd(target.slice(0, live.shown));
+      scrollIfNearBottom();
+    }
+    if (live.done && live.shown >= target.length) finishHwLive(session);
+  }, 16);
+}
+
+function finishHwLive(session) {
+  const live = session.live;
+  if (!live) return;
+  if (live.timer) { clearInterval(live.timer); live.timer = null; }
+  const final = stripThink(live.raw);
+  if (final) live.content.innerHTML = renderMd(final);
+  else live.wrap.remove(); // 纯 think/空回复：不留空气泡
+  session.live = null;
+  scrollIfNearBottom();
+}
+
 function onDelta(session, text) {
   if (!session) return;
-  if (!session.live) session.live = { ...addAgentBubble(session), raw: "" };
+  if (!session.live) session.live = { ...addAgentBubble(session), raw: "", shown: 0, done: false, timer: null };
   session.live.raw += text;
-  session.live.content.innerHTML = renderMd(stripThink(session.live.raw));
-  scrollIfNearBottom();
+  startHwTyper(session);
 }
 
 function onAssistantMessage(session, text) {
   if (!session) return;
+  if (session.live) {
+    // 流式收尾：终稿覆盖目标（防 delta 丢字残留半句），打字机追平后自动收尾
+    session.live.raw = text;
+    session.live.done = true;
+    startHwTyper(session);
+    return;
+  }
   const visible = stripThink(text);
   if (visible) {
-    const bubble = session.live ?? addAgentBubble(session);
-    bubble.content.innerHTML = renderMd(visible);
-    session.live = null;
-  } else if (session.live) {
-    session.live.wrap.remove();
-    session.live = null;
+    const bubble = addAgentBubble(session);
+    bubble.content.innerHTML = renderMd(visible); // 回放/非流式：整段直渲染
   }
   scrollIfNearBottom();
 }
@@ -1155,7 +1185,7 @@ function onTurnFinished(payload, session) {
     s.plan = null;
     s.waves = new Map();
     s.cards = new Map();
-    s.live = null;
+    finishHwLive(s); // 流中断靠 turn 结束兜底：未追平的 live 立即定型，不残留半句
   }
   state.hwBusy = false;
   updateComposerMode();

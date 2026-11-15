@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # 切真实供应商只改 .env 四行（BASE_URL/API_KEY/两个模型名），凭证永不落代码仓库
     model_gateway_base_url: str = "http://fake-openai:8000/v1"
     model_gateway_api_key: str = "demo-key-not-for-prod"
+    # 服务间共享密钥：harness sidecar → 平台 OpenAI 兼容代理（/api/model-gateway/v1/*）。
+    # 空 = 代理端点整体关闭（安全默认）；配置后 harness 以 Bearer 携带，平台 constant-time 比较。
+    model_gateway_proxy_key: str = ""
     model_chat_model: str = "demo-chat-1"
     model_embedding_model: str = "demo-embedding-1"
 

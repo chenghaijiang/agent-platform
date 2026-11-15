@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,12 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+# Langfuse 上报目标对齐：compose 传的是 LANGFUSE_BASE_URL（自建服务），而 langfuse SDK
+# 读 LANGFUSE_HOST（缺省则静默上报公网 cloud.langfuse.com，本地 Langfuse 永远为空）。
+# 必须在下方 import 链触发 SDK 客户端构建（model_gateway → langfuse.openai）之前执行。
+if os.environ.get("LANGFUSE_BASE_URL") and not os.environ.get("LANGFUSE_HOST"):
+    os.environ["LANGFUSE_HOST"] = os.environ["LANGFUSE_BASE_URL"]
+
 from agent_platform.api import admin_audit, admin_kbs, admin_users, me
 from agent_platform.auth.router import router as auth_router
 from agent_platform.chat.api import router as chat_router
@@ -24,6 +31,7 @@ from agent_platform.db.engine import build_session_factory
 from agent_platform.harness.api import router as harness_router
 from agent_platform.ingest.api import router as ingest_router
 from agent_platform.ingest.storage import DocumentStorage
+from agent_platform.model_gateway.api import proxy_router as model_gateway_proxy_router
 from agent_platform.model_gateway.api import router as model_gateway_router
 from agent_platform.model_gateway.gateway import ModelGateway
 from agent_platform.prompts.api import router as prompts_router
@@ -132,6 +140,7 @@ app.include_router(workbench_router)
 # ADR-019：harness 网关（catch-all /api/harness/{path}，需登录）——必须在静态挂载之前
 app.include_router(harness_router)
 app.include_router(model_gateway_router)
+app.include_router(model_gateway_proxy_router)
 
 
 @app.get("/healthz")

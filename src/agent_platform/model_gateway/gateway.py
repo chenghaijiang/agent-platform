@@ -244,6 +244,42 @@ class ModelGateway:
             latency_ms=latency_ms,
         )
 
+    # ---------- 服务间代理：harness sidecar → Langfuse 同口径上报（ADR-019 后续） ----------
+    async def relay_chat_completions(self, body: dict) -> dict:
+        """OpenAI-compatible chat/completions 透传（非流式）。
+
+        复用 langfuse 包裹的客户端原样转发调用方 payload：sidecar（代码工程师）的
+        模型请求经平台代理出口，与本平台自有链路同口径自动上报 generation。
+        """
+        try:
+            response = await self._client.chat.completions.create(**body)
+        except openai.OpenAIError as exc:
+            raise self._translate(exc, CAPABILITY_CHAT, str(body.get("model") or "")) from exc
+        return response.model_dump()
+
+    async def open_relay_stream(self, body: dict) -> AsyncIterator[str]:
+        """OpenAI-compatible chat/completions 透传（流式）：返回 SSE 帧序列。
+
+        create 阶段的异常在响应头发送前抛出（可翻译为 502）；迭代阶段的供应商错误
+        以 SSE error 帧传递（此时 HTTP 200 已发出，无法改写状态码）。
+        """
+        model = str(body.get("model") or "")
+        try:
+            stream = await self._client.chat.completions.create(**body)
+        except openai.OpenAIError as exc:
+            raise self._translate(exc, CAPABILITY_CHAT, model) from exc
+
+        async def frames() -> AsyncIterator[str]:
+            try:
+                async for chunk in stream:
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+            except openai.OpenAIError as exc:
+                error = self._translate(exc, CAPABILITY_CHAT, model)
+                yield f"data: {json.dumps({'error': {'type': type(error).__name__, 'message': str(error)}})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return frames()
+
     async def flush(self) -> None:
         """立即上报缓冲的观测数据（演示/验收用；高频业务路径依赖 SDK 批量上报即可）。"""
         try:
